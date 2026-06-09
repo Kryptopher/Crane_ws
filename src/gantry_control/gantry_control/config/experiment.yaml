@@ -1,0 +1,23 @@
+# Experiment logging and payload GPIO encoders (Jetson BOARD pin numbers)
+
+# Shared vision + gantry cart pose publish rate (see gantry.yaml stack_pose_publish_hz)
+/**:
+  ros__parameters:
+    stack_pose_publish_hz: 50.0
+
+# encoder_node parameters moved to encoder.yaml (loaded by gantry.launch.py)
+
+# payload_gantry_frame: only if camera is ON the cart (not used — OAK is on tripod).
+# payload_gantry_frame:
+#   ros__parameters:
+#     compensate_cart: true
+
+logger_node:
+  ros__parameters:
+    wait_motion_start: true
+    output_dir: "~/payload_logs"
+    flush_every: 50
+    warmup_sec: 1.0
+    stale_timeout_sec: 2.0
+    rate_window_sec: 2.0
+    log_traj_cmd: true

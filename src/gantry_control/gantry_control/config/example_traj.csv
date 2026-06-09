@@ -1,0 +1,7 @@
+# time_s, vx_mm_s, vy_mm_s  (times are seconds from /gantry/enable, t=0 = motors move)
+# Load with traj_player.py; motion clock starts on enable only.
+# Step in +X at 100 mm/s for 1 s, then hold
+0.000, 0.0, 0.0
+0.100, 100.0, 0.0
+1.100, 0.0, 0.0
+3.000, 0.0, 0.0

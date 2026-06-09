@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""
+Crane ops dashboard — HTTP server for crane_ops.html + ROS2 bridge.
+
+Serves the mission planner UI and exposes gantry state, payload encoders,
+and waypoint missions. Vision is ROS topics only (no MJPEG :8080 proxy).
+
+  ros2 run gantry_control crane_dashboard_server.py
+  # or: ros2 launch gantry_control mission_planner.launch.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, List, Optional
+
+import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Float64MultiArray
+from std_srvs.srv import Trigger
+
+from gantry_control.msg import GantryState
+from gantry_control.srv import MoveTo, SetMode
+from payload_perception_msgs.msg import PayloadState
+
+
+class CraneDashboardServer(Node):
+    def __init__(self) -> None:
+        super().__init__('crane_dashboard_server')
+        self.declare_parameter('dashboard_port', 8081)
+        self.declare_parameter('camera_proxy', False)
+        self.declare_parameter('stream_port', 8080)
+        self.declare_parameter('workspace_m', 1.0)
+        self.declare_parameter('move_timeout_s', 180.0)
+        self.declare_parameter('position_tolerance_m', 0.008)
+        self.declare_parameter('homing_timeout_s', 45.0)
+
+        self.dashboard_port = int(self.get_parameter('dashboard_port').value)
+        self.camera_proxy = bool(self.get_parameter('camera_proxy').value)
+        self.stream_port = int(self.get_parameter('stream_port').value)
+        self.workspace_m = float(self.get_parameter('workspace_m').value)
+        self.move_timeout_s = float(self.get_parameter('move_timeout_s').value)
+        self.position_tolerance_m = float(self.get_parameter('position_tolerance_m').value)
+        self.homing_timeout_s = float(self.get_parameter('homing_timeout_s').value)
+
+        self._cb = ReentrantCallbackGroup()
+        self._lock = threading.Lock()
+
+        self.gantry: Dict[str, Any] = {
+            'x': 0.0, 'y': 0.0, 'vx': 0.0, 'vy': 0.0,
+            'mode': 'IDLE', 'enabled': False, 'homed': False,
+            'homing_active': False, 'homing_status': '',
+            'estop': False, 'move_done': True,
+        }
+        self.pose_e: Optional[Dict[str, float]] = None
+        self.payload: Optional[Dict[str, Any]] = None
+        self._camera_jpeg: Optional[bytes] = None
+        self.waypoints: List[Dict[str, Any]] = []
+        self.mission_running = False
+        self._mission_stop = threading.Event()
+
+        self.create_subscription(
+            GantryState, '/gantry/state', self._on_gantry_state, 10,
+            callback_group=self._cb)
+        self.create_subscription(
+            Float64MultiArray, '/payload/pose_e', self._on_pose_e,
+            qos_profile_sensor_data,
+            callback_group=self._cb)
+        self.create_subscription(
+            PayloadState, '/payload/state', self._on_payload_state,
+            qos_profile_sensor_data,
+            callback_group=self._cb)
+        self.create_subscription(
+            CompressedImage, '/payload/camera/compressed', self._on_camera,
+            qos_profile_sensor_data,
+            callback_group=self._cb)
+
+        self._enable_cli = self.create_client(Trigger, '/gantry/enable')
+        self._disable_cli = self.create_client(Trigger, '/gantry/disable')
+        self._estop_cli = self.create_client(Trigger, '/gantry/estop')
+        self._clear_estop_cli = self.create_client(Trigger, '/gantry/clear_estop')
+        self._set_mode_cli = self.create_client(SetMode, '/gantry/set_mode')
+        self._move_to_cli = self.create_client(MoveTo, '/gantry/move_to')
+
+        share = self._share_dir()
+        self.web_dir = os.path.join(share, 'web')
+        self.get_logger().info(
+            f'Dashboard http://0.0.0.0:{self.dashboard_port}/')
+
+    @staticmethod
+    def _share_dir() -> str:
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            return get_package_share_directory('gantry_control')
+        except Exception:
+            return os.path.normpath(
+                os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+
+    def _on_gantry_state(self, msg: GantryState) -> None:
+        with self._lock:
+            self.gantry = {
+                'x': float(msg.x),
+                'y': float(msg.y),
+                'vx': float(msg.vx),
+                'vy': float(msg.vy),
+                'mode': str(msg.mode),
+                'enabled': bool(msg.enabled),
+                'homed': bool(msg.homed),
+                'homing_active': bool(msg.homing_active),
+                'homing_status': str(msg.homing_status),
+                'estop': bool(msg.estop),
+                'move_done': bool(msg.move_done),
+            }
+
+    def _on_pose_e(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) < 3:
+            return
+        with self._lock:
+            self.pose_e = {
+                'time': float(msg.data[0]),
+                'pitch_deg': float(msg.data[1]),
+                'roll_deg': float(msg.data[2]),
+            }
+            if len(msg.data) >= 5:
+                self.pose_e['pitch_count'] = float(msg.data[3])
+                self.pose_e['roll_count'] = float(msg.data[4])
+
+    def _on_payload_state(self, msg: PayloadState) -> None:
+        with self._lock:
+            self.payload = {
+                'motion_time_sec': float(msg.motion_time_sec),
+                'x1': float(msg.x1),
+                'z1': float(msg.z1),
+                'x2': float(msg.x2),
+                'z2': float(msg.z2),
+                'vx1': float(msg.vx1),
+                'vz1': float(msg.vz1),
+                'vx2': float(msg.vx2),
+                'vz2': float(msg.vz2),
+                'cam_x': float(msg.cam_x),
+                'cam_y': float(msg.cam_y),
+                'cam_z': float(msg.cam_z),
+                'gantry_x': float(msg.gantry_x),
+                'gantry_y': float(msg.gantry_y),
+                'gantry_z': float(msg.gantry_z),
+                'frame_id': str(msg.frame_id),
+                'valid': bool(msg.valid),
+                'interpolated': bool(msg.interpolated),
+            }
+
+    def _on_camera(self, msg: CompressedImage) -> None:
+        if not msg.data:
+            return
+        with self._lock:
+            self._camera_jpeg = bytes(msg.data)
+
+    def get_state(self) -> Dict[str, Any]:
+        with self._lock:
+            g = dict(self.gantry)
+            pose_e = dict(self.pose_e) if self.pose_e else None
+            payload = dict(self.payload) if self.payload else None
+            wps = list(self.waypoints)
+            running = self.mission_running
+        return {
+            'position': {'x': g['x'], 'y': g['y']},
+            'velocity': {'vx': g['vx'], 'vy': g['vy']},
+            'mode': g['mode'],
+            'enabled': g['enabled'],
+            'homed': g['homed'],
+            'homing_active': g.get('homing_active', False),
+            'homing_status': g.get('homing_status', ''),
+            'estop': g['estop'],
+            'move_done': g['move_done'],
+            'mission_running': running,
+            'workspace_m': self.workspace_m,
+            'pose_e': pose_e,
+            'payload': payload,
+            'waypoints': wps,
+            'camera_available': True,
+        }
+
+    def _call_trigger(self, client, timeout: float = 5.0) -> tuple[bool, str]:
+        if not client.wait_for_service(timeout_sec=2.0):
+            return False, f'Service {client.srv_name} not available'
+        future = client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        if not future.done() or future.result() is None:
+            return False, 'Service call failed'
+        r = future.result()
+        return bool(r.success), str(r.message)
+
+    def _call_set_mode(
+        self,
+        mode: str,
+        *,
+        csv_path: str = '',
+        jog_preset: int = 0,
+        target_x: float = 0.0,
+        target_y: float = 0.0,
+        timeout: float = 30.0,
+    ) -> tuple[bool, str]:
+        if not self._set_mode_cli.wait_for_service(timeout_sec=2.0):
+            return False, 'Service /gantry/set_mode not available'
+        req = SetMode.Request()
+        req.mode = mode
+        req.csv_path = csv_path
+        req.jog_speed_preset = int(jog_preset)
+        req.target_x = float(target_x)
+        req.target_y = float(target_y)
+        future = self._set_mode_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        if not future.done() or future.result() is None:
+            return False, 'set_mode call failed'
+        r = future.result()
+        return bool(r.success), str(r.message)
+
+    def _call_move_to(self, x: float, y: float, timeout: float = 5.0) -> tuple[bool, str]:
+        if not self._move_to_cli.wait_for_service(timeout_sec=2.0):
+            return False, 'Service /gantry/move_to not available'
+        req = MoveTo.Request()
+        req.x = float(x)
+        req.y = float(y)
+        future = self._move_to_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        if not future.done() or future.result() is None:
+            return False, 'move_to call failed'
+        r = future.result()
+        return bool(r.success), str(r.message)
+
+    def handle_action(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        if name == 'enable':
+            ok, msg = self._call_trigger(self._enable_cli)
+        elif name == 'disable':
+            ok, msg = self._call_trigger(self._disable_cli)
+        elif name == 'home':
+            ok, msg = self._call_set_mode('HOME', timeout=120.0)
+        elif name == 'estop':
+            ok, msg = self._call_trigger(self._estop_cli)
+        elif name == 'clear_estop':
+            ok, msg = self._call_trigger(self._clear_estop_cli)
+        elif name == 'traj_arm':
+            ok, msg = self._call_set_mode('TRAJ')
+        elif name == 'set_mode':
+            mode = str(data.get('mode', 'IDLE')).upper()
+            jog_preset = int(data.get('jog_preset', 0))
+            csv_path = str(data.get('csv_path', ''))
+            ok, msg = self._call_set_mode(mode, csv_path=csv_path, jog_preset=jog_preset)
+        elif name == 'move_to':
+            x = float(data.get('x', 0.0))
+            y = float(data.get('y', 0.0))
+            with self._lock:
+                mode = self.gantry.get('mode', 'IDLE')
+            if mode != 'MISSION':
+                ok, msg = self._call_set_mode('MISSION')
+                if not ok:
+                    return {'status': 'error', 'message': msg}
+            ok, msg = self._call_move_to(x, y)
+        else:
+            return {'status': 'error', 'message': f'Unknown action: {name}'}
+        return {'status': 'ok' if ok else 'error', 'message': msg}
+
+    def set_waypoints(self, wps: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.waypoints = list(wps)
+
+    def clear_waypoints(self) -> None:
+        with self._lock:
+            self.waypoints = []
+
+    def stop_mission(self) -> None:
+        self._mission_stop.set()
+        self.mission_running = False
+        self._call_set_mode('IDLE')
+
+    def safe_shutdown_gantry(self) -> None:
+        """Best-effort motor disable when dashboard exits (Ctrl+C on launch)."""
+        self.get_logger().warn(
+            'Dashboard shutdown — disabling gantry motors (/gantry/disable)')
+        try:
+            self._call_set_mode('IDLE', timeout=3.0)
+        except Exception:
+            pass
+        ok, msg = self._call_trigger(self._disable_cli, timeout=5.0)
+        if ok:
+            self.get_logger().info(f'Gantry disabled: {msg}')
+        else:
+            self.get_logger().warn(f'Gantry disable on exit: {msg}')
+
+    def _wait_sensor_homing(self) -> bool:
+        """Wait until gantry sensor homing finishes (auto-home before MISSION)."""
+        deadline = time.monotonic() + self.homing_timeout_s
+        while time.monotonic() < deadline:
+            if self._mission_stop.is_set():
+                return False
+            with self._lock:
+                active = bool(self.gantry.get('homing_active', False))
+                homed = bool(self.gantry.get('homed', False))
+                mode = str(self.gantry.get('mode', ''))
+            if not active and homed and mode == 'MISSION':
+                return True
+            if not active and mode == 'IDLE' and not homed:
+                self.get_logger().error('Homing failed — gantry returned IDLE without homed')
+                return False
+            time.sleep(0.05)
+        self.get_logger().error('Sensor homing timeout')
+        return False
+
+    def _wait_move_done(self) -> bool:
+        """Wait for gantry move_done (move_in_progress cleared)."""
+        deadline = time.monotonic() + self.move_timeout_s
+        started = False
+        while time.monotonic() < deadline:
+            if self._mission_stop.is_set():
+                return False
+            with self._lock:
+                done = bool(self.gantry.get('move_done', True))
+            if not started:
+                if not done:
+                    started = True
+            elif done:
+                return True
+            time.sleep(0.05)
+        self.get_logger().error('Move timeout')
+        return False
+
+    def execute_mission(self) -> None:
+        with self._lock:
+            wps = list(self.waypoints)
+        if not wps:
+            self.get_logger().warn('No waypoints')
+            return
+
+        self._mission_stop.clear()
+        self.mission_running = True
+        self.get_logger().info(f'Mission start: {len(wps)} waypoints')
+
+        ok, msg = self._call_set_mode('MISSION')
+        if not ok:
+            self.get_logger().error(f'Cannot enter MISSION: {msg}')
+            self.mission_running = False
+            return
+
+        with self._lock:
+            need_wait = bool(self.gantry.get('homing_active', False))
+        if need_wait and not self._wait_sensor_homing():
+            self.mission_running = False
+            return
+
+        for i, wp in enumerate(wps):
+            if self._mission_stop.is_set():
+                self.get_logger().warn('Mission stopped')
+                break
+            tx = float(wp.get('x', 0.0))
+            ty = float(wp.get('y', 0.0))
+            self.get_logger().info(f'WP {i + 1}/{len(wps)} → ({tx:.3f}, {ty:.3f}) m')
+            ok, msg = self._call_move_to(tx, ty)
+            if not ok:
+                self.get_logger().error(msg)
+                break
+            if not self._wait_move_done():
+                break
+            dwell = float(wp.get('dwell', 0.0))
+            if dwell > 0 and not self._mission_stop.is_set():
+                time.sleep(dwell)
+
+        self.mission_running = False
+        self.get_logger().info('Mission finished')
+
+    def start_mission_async(self) -> bool:
+        if self.mission_running:
+            return False
+        t = threading.Thread(target=self.execute_mission, daemon=True)
+        t.start()
+        return True
+
+
+dashboard_node: Optional[CraneDashboardServer] = None
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    server_version = 'CraneDashboard/1.0'
+
+    def log_message(self, fmt: str, *args) -> None:
+        if args:
+            req = str(args[0]) if args else ''
+            if '/camera/' in req:
+                return
+            if len(args) > 1 and str(args[1]) in ('502', '404'):
+                return
+        if args and str(args[1]) not in ('200', '304'):
+            super().log_message(fmt, *args)
+
+    def _cors(self) -> None:
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        path = self.path.split('?', 1)[0]
+        if path in ('/', '/crane_ops.html'):
+            self._serve_file('crane_ops.html', 'text/html; charset=utf-8')
+        elif path == '/state':
+            self._json_response(dashboard_node.get_state())
+        elif path.startswith('/camera/jpeg'):
+            self._serve_camera_jpeg()
+        elif path.startswith('/camera/stream'):
+            self._proxy_camera_stream()
+        else:
+            rel = path.lstrip('/')
+            fpath = os.path.join(dashboard_node.web_dir, rel)
+            if os.path.isfile(fpath):
+                ctype = 'application/octet-stream'
+                if rel.endswith('.css'):
+                    ctype = 'text/css'
+                elif rel.endswith('.js'):
+                    ctype = 'application/javascript'
+                self._serve_path(fpath, ctype)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        path = self.path.split('?', 1)[0]
+        data = self._read_json()
+        node = dashboard_node
+
+        if path.startswith('/action/'):
+            name = path[len('/action/'):].strip('/')
+            self._json_response(node.handle_action(name, data))
+            return
+        if path == '/set_waypoints':
+            node.set_waypoints(data.get('waypoints', []))
+            self._json_response({'status': 'updated', 'count': len(node.waypoints)})
+            return
+        if path == '/execute':
+            if node.mission_running:
+                self._json_response({'status': 'error', 'message': 'Already running'})
+                return
+            if 'waypoints' in data:
+                node.set_waypoints(data.get('waypoints', []))
+            started = node.start_mission_async()
+            self._json_response({'status': 'started' if started else 'error'})
+            return
+        if path == '/stop':
+            node.stop_mission()
+            self._json_response({'status': 'stopped'})
+            return
+        if path == '/clear':
+            node.clear_waypoints()
+            self._json_response({'status': 'cleared'})
+            return
+
+        self._json_response({'status': 'error', 'message': 'Unknown path'})
+
+    def _read_json(self) -> Dict[str, Any]:
+        n = int(self.headers.get('Content-Length', 0))
+        if n <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode('utf-8'))
+        except json.JSONDecodeError:
+            return {}
+
+    def _json_response(self, obj: Dict[str, Any], code: int = 200) -> None:
+        body = json.dumps(obj).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self._cors()
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_file(self, name: str, content_type: str) -> None:
+        self._serve_path(os.path.join(dashboard_node.web_dir, name), content_type)
+
+    def _serve_path(self, fpath: str, content_type: str) -> None:
+        try:
+            with open(fpath, 'rb') as f:
+                body = f.read()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-Type', content_type)
+        self._cors()
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_camera_jpeg(self) -> None:
+        with dashboard_node._lock:
+            jpeg = dashboard_node._camera_jpeg
+        if not jpeg:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._cors()
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Cache-Control', 'no-store')
+        self._cors()
+        self.send_header('Content-Length', str(len(jpeg)))
+        self.end_headers()
+        self.wfile.write(jpeg)
+
+    def _proxy_camera_stream(self) -> None:
+        if not dashboard_node.camera_proxy:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._cors()
+            self.end_headers()
+            return
+        upstream = f'http://127.0.0.1:{dashboard_node.stream_port}/stream'
+        try:
+            req = urllib.request.Request(upstream, headers={'Connection': 'close'})
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                self.send_response(resp.status)
+                for key, val in resp.headers.items():
+                    kl = key.lower()
+                    if kl in ('transfer-encoding', 'connection'):
+                        continue
+                    self.send_header(key, val)
+                self._cors()
+                self.end_headers()
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self.send_error(HTTPStatus.BAD_GATEWAY, explain=str(exc))
+
+
+def run_http_server(port: int) -> None:
+    httpd = ThreadingHTTPServer(('0.0.0.0', port), DashboardHandler)
+    print(f'\n  Crane ops UI: http://0.0.0.0:{port}/\n')
+    httpd.serve_forever()
+
+
+def main(args=None) -> None:
+    global dashboard_node
+    rclpy.init(args=args)
+    dashboard_node = CraneDashboardServer()
+    executor = MultiThreadedExecutor()
+    executor.add_node(dashboard_node)
+
+    port = dashboard_node.dashboard_port
+    http_thread = threading.Thread(target=run_http_server, args=(port,), daemon=True)
+    http_thread.start()
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        print('\n[crane_dashboard] Ctrl+C — shutting down…')
+    finally:
+        if dashboard_node is not None:
+            dashboard_node.safe_shutdown_gantry()
+            dashboard_node.destroy_node()
+        print('[crane_dashboard] Exit complete.')
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

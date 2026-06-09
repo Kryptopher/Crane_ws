@@ -1,0 +1,6 @@
+# time_s, vx_mm_s, vy_mm_s
+# Step input: 100mm/s in X for 1 second, then stop
+0.000, 0.0, 0.0
+0.100, 100.0, 0.0
+1.100, 0.0, 0.0
+3.000, 0.0, 0.0

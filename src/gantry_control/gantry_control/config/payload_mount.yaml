@@ -1,0 +1,9 @@
+# Tripod OAK → gantry axis calibration (saved after bench in ops/PAYLOAD_FRAMES.md).
+# gantry.launch.py reads these defaults when the file exists.
+payload_mount:
+  gantry_yaw_deg: 0.0
+  gantry_pitch_deg: 0.0
+  gantry_roll_deg: 0.0
+  gantry_sign_x: 1.0
+  gantry_sign_y: 1.0
+  gantry_sign_z: 1.0

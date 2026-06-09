@@ -1,0 +1,44 @@
+================================================================================
+CRANE_WS HANDOFF — see ops/HANDOFF.md for full document
+================================================================================
+Jetson: 192.168.0.101 (SSH, :8080 MJPEG, :8081 dashboard)
+OAK:    192.168.0.153 (oak_ip — NOT the Jetson)
+WS:     /home/sanjay/crane_ws
+
+SHELL (every terminal):
+  source /opt/ros/humble/setup.bash
+  source ~/crane_ws/install/setup.bash
+
+TRIPOD CAMERA (fixed) — gantry pose from payload_tracker only.
+  Do NOT use payload_gantry_frame / start_gantry_frame:=true
+  Details: ops/PAYLOAD_FRAMES.md  ops/HANDOFF.md
+
+TRACKER ONLY:
+  cd ~/crane_ws && ./ops/run_payload_tracker.sh
+  http://192.168.0.101:8080/     TOP-DOWN panel + tags
+  ros2 topic echo /payload/state --once
+  (--no-wait-motion required for standalone)
+
+MISSION PLANNER + UI:
+  ros2 launch gantry_control mission_planner.launch.py oak_ip:=192.168.0.153
+  http://192.168.0.101:8081/
+
+FULL GANTRY:
+  ros2 launch gantry_control gantry.launch.py oak_ip:=192.168.0.153
+
+PRIMARY TOPIC: /payload/state (PayloadState)
+  cam_x/y/z, gantry_x/y/z, x1/z1/x2/z2, motion_time_sec, frame_id
+
+REBUILD:
+  cd ~/crane_ws && colcon build --symlink-install && source install/setup.bash
+
+ADAPTIVE ID:
+  ros2 run gantry_control adaptive_id_player.py
+  (default gantry_z; use --swing-field cam_x before mount cal)
+
+SAFETY: workspace 1.0m ON; payload vision limits OFF
+LOGS: ~/payload_logs
+
+================================================================================
+END — full handoff: ops/HANDOFF.md
+================================================================================

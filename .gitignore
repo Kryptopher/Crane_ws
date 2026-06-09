@@ -1,0 +1,17 @@
+build/
+install/
+log/
+.cache/
+csv/
+rosbag2_*/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+*.bag
+*.db3
+*.sqlite3
+
+.DS_Store

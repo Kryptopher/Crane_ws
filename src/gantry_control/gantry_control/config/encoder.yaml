@@ -1,0 +1,39 @@
+# GPIO payload encoders (encoder_node only — BOARD pin numbers on Jetson)
+
+encoder_node:
+  ros__parameters:
+    enc1_a: 33   # Pitch A — GPIO13
+    enc1_b: 32   # Pitch B — GPIO07
+    enc2_a: 29   # Roll A  — GPIO01
+    enc2_b: 31   # Roll B  — GPIO11
+    # 4x quadrature can produce valid edges closer than 1 ms during fast swing;
+    # software debounce drops those edges and creates drift. Use 0 unless the
+    # diagnostics topic shows invalid transitions while the payload is still.
+    debounce_ms: 0
+    use_pull_up: true
+    # x1_a counts only A rising edges and uses B for direction. This reduces
+    # callback load versus x4/x2 and is the most reliable GPIO mode for fast
+    # payload swing, at lower angular resolution.
+    decode_mode: x1_a
+    interrupt_on_b: false
+    recover_missed_edges: true
+
+    publish_rate_hz: 50.0
+    follow_sync_hz: true
+    publish_when_idle: true
+    wait_motion_start: false
+    zero_on_start: true
+    counts_are_degrees: false
+    degrees_per_count: 0.0
+    ppr: 1000
+    count_mode: 1
+    gear_ratio: 1.0
+    rope_length_m: 1.20
+    rel_vel_ema_alpha: 0.35
+    rel_vel_min_dt_s: 0.003
+    # Payload relative-frame mapping: pitch -> gantry X, roll -> gantry Y,
+    # straight-down rest = (0, 0, -rope_length_m). Flip a sign (+1 / -1) if the
+    # horizontal swing direction reads backwards versus physical motion.
+    rel_sign_x: 1.0
+    rel_sign_y: 1.0
+    log_interval_sec: 0.0

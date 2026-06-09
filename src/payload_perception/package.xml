@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>payload_perception</name>
+  <version>1.1.0</version>
+  <description>OAK-D payload vision tracker and optional GPIO joint encoders</description>
+  <maintainer email="sanjay@lsu.edu">Sanjay</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>gantry_control</exec_depend>
+  <exec_depend>payload_perception_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

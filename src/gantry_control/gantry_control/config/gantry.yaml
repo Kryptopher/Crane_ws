@@ -1,0 +1,54 @@
+# gantry_controller parameters
+
+gantry_controller:
+  ros__parameters:
+    # Homing: sensor_inputs = read SC4 0A/1B, seek back then left (no ClearView homing save)
+    # teknic_homing = Motion.Homing.Initiate (requires ClearView HOME_TO_SWITCH setup)
+    homing_mode: sensor_inputs
+    auto_home_before_run: true
+    homing_timeout_s: 30.0
+    homing_sequential: true
+    # Homing seek speed is derived from mission_move_vel_ms in code.
+    # Legacy params below are retained for compatibility and ignored.
+    homing_seek_vel_ms: 0.15
+    homing_seek_vx_ms: -0.15
+    homing_seek_vy_ms: -0.15
+    # SC4: 0A = back (node 0 InA), 1B = left (node 1 InB)
+    home_back_node: 0
+    home_back_input: a
+    home_left_node: 1
+    home_left_input: b
+    # SC4 LED at home: 0A green OFF (active-low), 1B ON (active-high)
+    home_back_input_active_high: false
+    home_left_input_active_high: true
+    homing_input_debounce_ticks: 3
+
+    # Cart pose in gantry frame (origin at last successful homing)
+    publish_odom: true
+    publish_odom_tf: true
+    odom_frame_id: gantry
+    odom_child_frame_id: gantry_cart
+
+    # Gantry Cartesian workspace (motor encoders → cart_x, cart_y)
+    workspace_limit_m: 1.00
+    workspace_limit_enable: true
+
+    # Payload vision limits disabled until crane-frame pose is available
+    payload_position_limit_mm: 1000.0
+    payload_limit_monitor_enable: false
+
+    # TRAJ: real-time STREAM commands on /traj_cmd (research nodes)
+    traj_realtime_enable: true
+    traj_stream_timeout_s: 0.5
+
+    # Joystick → cart velocity (lab frame: bottom-left origin, +X right, +Y up)
+    joy_axis_sign_x: -1.0
+    joy_axis_sign_y: 1.0
+
+    # /gantry/state bootstrap rate; follows /stack/pose_sync_hz when adaptive
+    stack_pose_publish_hz: 50.0
+    stack_pose_sync_adaptive: true
+
+    # Dashboard go-to / MoveTo position moves (Teknic VelLimit from cart speed)
+    mission_move_vel_ms: 0.10
+    mission_move_accel_ms2: 0.20

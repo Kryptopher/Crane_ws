@@ -1,0 +1,6 @@
+# Command a position move (mission planner)
+float64 x    # target X in meters
+float64 y    # target Y in meters
+---
+bool success
+string message

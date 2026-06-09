@@ -1,0 +1,2823 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Crane Ops — Stein Lab</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0e13;
+      --panel: #111520;
+      --border: #1e2535;
+      --border-bright: #2d3a52;
+      --accent: #00d4ff;
+      --accent2: #ff6b35;
+      --green: #00e87a;
+      --red: #ff3b5c;
+      --yellow: #ffd147;
+      --text: #c8d4e8;
+      --text-dim: #5a6a85;
+      --text-bright: #e8f0ff;
+      --mono: 'JetBrains Mono', monospace;
+      --display: 'Syne', sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--mono);
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #sidebar {
+      width: 320px;
+      min-width: 320px;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      background: var(--panel);
+    }
+
+    #header {
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(135deg, #0f1624 0%, #111d2e 100%);
+    }
+
+    #header .logo {
+      font-family: var(--display);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+
+    #header h1 {
+      font-family: var(--display);
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-bright);
+      line-height: 1.2;
+    }
+
+    #header .subtitle {
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 0.08em;
+      margin-top: 4px;
+    }
+
+    #statusbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--border);
+      background: #0d1118;
+    }
+
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      flex-shrink: 0;
+    }
+    .dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot.running { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 1s ease-in-out infinite; }
+    .dot.preview { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+    .dot.error { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+    @keyframes pulse {
+      0%,100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    #statusLabel {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+    #statusLabel.connected { color: var(--green); }
+    #statusLabel.running { color: var(--accent); }
+    #statusLabel.preview { color: var(--yellow); }
+    #statusLabel.error { color: var(--red); }
+
+    #poseLine {
+      margin-left: auto;
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 0.04em;
+    }
+
+    #posePanel {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .pose-cell {
+      background: var(--panel);
+      padding: 10px 14px;
+    }
+    .pose-cell .label {
+      font-size: 9px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+    .pose-cell .value {
+      font-size: 16px;
+      font-weight: 500;
+      color: var(--green);
+      letter-spacing: 0.02em;
+    }
+    .pose-cell .unit { font-size: 10px; color: var(--text-dim); margin-left: 2px; }
+
+    #encPanel {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 4px;
+    }
+
+    .enc-cell {
+      background: #0d1118;
+      padding: 8px 10px;
+    }
+    .enc-cell .label {
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 3px;
+    }
+    .enc-cell .value {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--accent);
+      letter-spacing: 0.02em;
+    }
+    .enc-cell .value.green { color: var(--green); }
+    .enc-cell .value.dim { color: var(--text); font-size: 11px; }
+    .enc-cell .unit { font-size: 10px; color: var(--text-dim); margin-left: 2px; }
+    .enc-cell.span2 { grid-column: span 2; }
+
+    .enc-note {
+      font-size: 9px;
+      color: var(--text-dim);
+      line-height: 1.45;
+      margin-bottom: 6px;
+    }
+
+    #controls {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .section-label {
+      font-size: 9px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    select {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #0d1118;
+      border: 1px solid var(--border-bright);
+      color: var(--text-bright);
+      padding: 8px 10px;
+      border-radius: 4px;
+      width: 100%;
+    }
+    select:focus { outline: none; border-color: var(--accent); }
+
+    .mode-panel { display: none; flex-direction: column; gap: 10px; }
+    .mode-panel.active { display: flex; }
+
+    .task-panel { display: none; flex-direction: column; gap: 10px; }
+    .task-panel.active { display: flex; }
+
+    #statusChips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .chip {
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 4px 8px;
+      border-radius: 3px;
+      border: 1px solid var(--border-bright);
+      color: var(--text-dim);
+      background: #0d1118;
+    }
+    .chip.ok { border-color: var(--green); color: var(--green); }
+    .chip.warn { border-color: var(--yellow); color: var(--yellow); }
+    .chip.bad { border-color: var(--red); color: var(--red); }
+
+    .task-tabs {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 4px;
+      margin-bottom: 10px;
+    }
+    .task-tab {
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      padding: 8px 2px;
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      background: #0d1118;
+      color: var(--text-dim);
+      cursor: pointer;
+      text-transform: uppercase;
+    }
+    .task-tab:hover { border-color: var(--accent); color: var(--accent); }
+    .task-tab.active {
+      background: rgba(0, 212, 255, 0.12);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .flow-hint {
+      font-size: 10px;
+      color: var(--text-dim);
+      line-height: 1.45;
+      margin: 0 0 8px;
+      padding: 8px 10px;
+      background: #0d1118;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+    }
+    .flow-hint b { color: var(--text); font-weight: 500; }
+
+    details.advanced {
+      margin-top: 10px;
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+    details.advanced summary {
+      cursor: pointer;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 6px 0;
+      color: var(--text-dim);
+    }
+    details.advanced summary:hover { color: var(--accent); }
+
+    .btn-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 6px;
+    }
+    .btn-row-2 { grid-template-columns: 1fr 1fr; }
+
+    button {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+      padding: 9px 10px;
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      background: transparent;
+      color: var(--text);
+      transition: all 0.15s;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.06); }
+    button.primary {
+      background: var(--accent);
+      color: #000;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    button.primary:hover { background: #33dcff; }
+    button.danger { border-color: var(--red); color: var(--red); }
+    button.danger:hover { background: rgba(255,59,92,0.1); }
+    button.disable-btn { border-color: #888; color: #ccc; }
+    button.disable-btn:hover { border-color: #aaa; background: rgba(255,255,255,0.06); }
+
+    .estop-panel {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-bright);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .estop-panel label {
+      font-size: 9px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--red);
+    }
+    .btn-estop {
+      width: 100%;
+      padding: 20px 12px;
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      cursor: pointer;
+      border-radius: 6px;
+      border: 3px solid #ff6b7a;
+      background: linear-gradient(180deg, #e8223a 0%, #b01028 100%);
+      color: #fff;
+      box-shadow: 0 4px 0 #6b0818, 0 8px 16px rgba(255, 40, 70, 0.35);
+      transition: transform 0.08s, box-shadow 0.08s;
+    }
+    .btn-estop:hover {
+      background: linear-gradient(180deg, #ff3b52 0%, #c41e32 100%);
+      color: #fff;
+      transform: translateY(1px);
+      box-shadow: 0 2px 0 #6b0818, 0 4px 12px rgba(255, 40, 70, 0.45);
+    }
+    .btn-estop:active {
+      transform: translateY(4px);
+      box-shadow: 0 0 0 #6b0818, 0 2px 6px rgba(255, 40, 70, 0.3);
+    }
+    .btn-estop-clear {
+      width: 100%;
+      padding: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      background: transparent;
+      color: var(--text-dim);
+    }
+    .btn-estop-clear:hover { border-color: var(--accent); color: var(--accent); }
+    body.estop-active .btn-estop {
+      animation: estop-pulse 1s ease-in-out infinite;
+    }
+    @keyframes estop-pulse {
+      0%, 100% { box-shadow: 0 4px 0 #6b0818, 0 0 0 0 rgba(255, 59, 92, 0.5); }
+      50% { box-shadow: 0 4px 0 #6b0818, 0 0 0 10px rgba(255, 59, 92, 0); }
+    }
+
+    .params-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+
+    .param-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .param-group label {
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+    input[type="number"] {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #0d1118;
+      border: 1px solid var(--border-bright);
+      color: var(--text-bright);
+      padding: 7px 10px;
+      border-radius: 4px;
+      width: 100%;
+    }
+    input[type="number"]:focus { outline: none; border-color: var(--accent); }
+
+    .ws-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .ws-row label {
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+    .ws-row input { flex: 1; }
+
+    #wpSection {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    #wpHeader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 9px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      flex-shrink: 0;
+    }
+
+    #wpCount { font-size: 11px; color: var(--accent); font-weight: 500; }
+
+    #wpTable {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    #wpTable th {
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      font-weight: 400;
+      background: #0d1118;
+      position: sticky;
+      top: 0;
+    }
+    #wpTable td {
+      padding: 4px 6px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    #wpTable tr:hover td { background: rgba(255,255,255,0.02); }
+    #wpTable td:first-child {
+      font-size: 10px;
+      color: var(--text-dim);
+      width: 22px;
+      text-align: center;
+    }
+    #wpTable input {
+      font-family: var(--mono);
+      font-size: 11px;
+      background: #0d1118;
+      border: 1px solid transparent;
+      color: var(--text);
+      padding: 4px 6px;
+      border-radius: 3px;
+      width: 100%;
+    }
+    #wpTable input:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: #111827;
+    }
+    #wpTable .del-btn {
+      font-size: 10px;
+      padding: 3px 6px;
+      border-color: transparent;
+      color: var(--text-dim);
+      background: transparent;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    #wpTable .del-btn:hover { color: var(--red); border-color: var(--red); background: rgba(255,59,92,0.08); }
+
+    #center {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      min-width: 0;
+    }
+
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      flex-shrink: 0;
+    }
+
+    #toolbar .tool-label {
+      font-size: 9px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    .toolbar-sep {
+      width: 1px;
+      height: 20px;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+
+    #toolbar .toolbar-btn {
+      margin-left: auto;
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 4px 10px;
+      border: 1px solid var(--border-bright);
+      border-radius: 3px;
+      background: #151c2a;
+      color: var(--text);
+      cursor: pointer;
+    }
+    #toolbar .toolbar-btn:hover {
+      border-color: var(--red);
+      color: var(--red);
+    }
+    #toolbar .toolbar-btn.danger {
+      border-color: rgba(255, 59, 92, 0.35);
+      color: var(--red);
+    }
+
+    #workArea {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+    }
+
+    #mainCol {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    #canvasWrap {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    #canvasWrap::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.03) 2px,
+        rgba(0,0,0,0.03) 4px
+      );
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    #c {
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      cursor: crosshair;
+      display: block;
+      box-shadow: 0 0 40px rgba(0,212,255,0.05), inset 0 0 60px rgba(0,0,0,0.3);
+    }
+
+    #canvasLabel {
+      position: absolute;
+      top: 30px;
+      left: 30px;
+      font-size: 9px;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      opacity: 0.6;
+      z-index: 11;
+      line-height: 1.5;
+    }
+
+    #canvasSub {
+      display: block;
+      font-size: 8px;
+      letter-spacing: 0.08em;
+      text-transform: none;
+      color: var(--text-dim);
+      opacity: 0.85;
+      margin-top: 2px;
+    }
+
+    .vision-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+
+    .vision-toolbar button {
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.06em;
+      padding: 4px 8px;
+      border: 1px solid var(--border-bright);
+      border-radius: 3px;
+      background: #0d1118;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .vision-toolbar button:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    #splitterV {
+      width: 6px;
+      flex-shrink: 0;
+      cursor: col-resize;
+      background: var(--border);
+      position: relative;
+      z-index: 20;
+      transition: background 0.15s;
+    }
+    #splitterV:hover,
+    #splitterV.dragging {
+      background: var(--accent);
+    }
+    #splitterV::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 2px;
+      height: 32px;
+      border-radius: 1px;
+      background: var(--border-bright);
+    }
+
+    #rail {
+      width: var(--rail-w, 440px);
+      min-width: 280px;
+      max-width: 65vw;
+      flex-shrink: 0;
+      background: var(--panel);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    #railInner {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .rail-pane {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px 14px;
+      min-height: 120px;
+      overflow: hidden;
+    }
+
+    #railCamera {
+      flex: 0 0 var(--camera-pane-h, 52%);
+      min-height: 160px;
+    }
+
+    #railTelemetry {
+      flex: 1;
+      min-height: 140px;
+    }
+
+    #splitterH {
+      height: 6px;
+      flex-shrink: 0;
+      cursor: row-resize;
+      background: var(--border);
+      position: relative;
+      z-index: 20;
+      transition: background 0.15s;
+    }
+    #splitterH:hover,
+    #splitterH.dragging {
+      background: var(--accent);
+    }
+    #splitterH::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 32px;
+      height: 2px;
+      border-radius: 1px;
+      background: var(--border-bright);
+    }
+
+    .rail-block {
+      padding: 0;
+      border: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .rail-title {
+      font-size: 9px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    #cameraBox {
+      flex: 1;
+      min-height: 0;
+      background: #090c12;
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+
+    #cameraBox img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    #cameraPlaceholder {
+      font-size: 10px;
+      color: var(--text-dim);
+      text-align: center;
+      padding: 12px;
+      line-height: 1.5;
+    }
+
+    #visionChartWrap {
+      flex: 0 0 200px;
+      min-height: 150px;
+      background: #090c12;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-top: 6px;
+      overflow: visible;
+    }
+    #visionChartWrap canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    #chartWrap {
+      flex: 1;
+      min-height: 80px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #chartC {
+      width: 100%;
+      flex: 1;
+      min-height: 100px;
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      background: #090c12;
+      display: block;
+    }
+
+    .resize-hint {
+      font-size: 9px;
+      color: var(--text-dim);
+      letter-spacing: 0.06em;
+      opacity: 0.7;
+    }
+
+    #hint {
+      padding: 8px 20px;
+      background: var(--panel);
+      border-top: 1px solid var(--border);
+      font-size: 10px;
+      color: var(--text-dim);
+      display: flex;
+      gap: 20px;
+      flex-shrink: 0;
+    }
+    #hint span { display: flex; align-items: center; gap: 5px; }
+    #hint b { color: var(--text); font-weight: 500; }
+  </style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div id="header">
+    <div class="logo">Stein Lab · LSU</div>
+    <h1>Crane Ops</h1>
+    <div class="subtitle">gantry_control · payload_perception</div>
+  </div>
+
+  <div id="statusbar">
+    <div class="dot preview" id="statusDot"></div>
+    <span id="statusLabel" class="preview">CONNECTING</span>
+    <span id="poseLine">—</span>
+  </div>
+
+  <div id="posePanel">
+    <div class="pose-cell">
+      <div class="label">X Position</div>
+      <div class="value" id="pX">0.000<span class="unit">m</span></div>
+    </div>
+    <div class="pose-cell">
+      <div class="label">Y Position</div>
+      <div class="value" id="pY">0.000<span class="unit">m</span></div>
+    </div>
+    <div class="pose-cell">
+      <div class="label">Homed</div>
+      <div class="value" id="pHomed" style="font-size:14px">—</div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <div id="statusChips">
+      <span class="chip" id="chipConn">offline</span>
+      <span class="chip" id="chipEn">motors off</span>
+      <span class="chip" id="chipHome">not homed</span>
+      <span class="chip" id="chipMode">—</span>
+    </div>
+
+    <div class="btn-row" style="margin-bottom:8px">
+      <button class="primary" onclick="apiAction('enable')">Enable</button>
+      <button id="btnHome" onclick="runHoming()">Home</button>
+      <button class="disable-btn" onclick="apiAction('disable')">Disable</button>
+    </div>
+
+    <div class="task-tabs">
+      <button type="button" class="task-tab" data-task="jog" onclick="setTask('jog')">Jog</button>
+      <button type="button" class="task-tab active" data-task="goto" onclick="setTask('goto')">Go to</button>
+      <button type="button" class="task-tab" data-task="mission" onclick="setTask('mission')">Mission</button>
+      <button type="button" class="task-tab" data-task="csv" onclick="setTask('csv')">CSV</button>
+      <button type="button" class="task-tab" data-task="traj" onclick="setTask('traj')">TRAJ</button>
+    </div>
+
+    <div id="panelJOG" class="task-panel">
+      <div class="param-group">
+        <label>Jog speed (gamepad L1 + stick)</label>
+        <select id="jogPreset" onchange="syncBackendMode('JOG')">
+          <option value="0">Slow — 100 mm/s</option>
+          <option value="1" selected>Med — 300 mm/s</option>
+          <option value="2">Fast — 500 mm/s</option>
+        </select>
+      </div>
+      <button type="button" onclick="syncBackendMode('JOG')">Arm jog mode</button>
+    </div>
+
+    <div id="panelGOTO" class="task-panel active">
+      <div class="params-row">
+        <div class="param-group">
+          <label>Target X (m)</label>
+          <input id="tgtX" type="number" step="0.001" value="0.500" min="0" oninput="onTargetTyped()">
+        </div>
+        <div class="param-group">
+          <label>Target Y (m)</label>
+          <input id="tgtY" type="number" step="0.001" value="0.400" min="0" oninput="onTargetTyped()">
+        </div>
+      </div>
+      <div class="btn-row btn-row-2">
+        <button type="button" onclick="useCurrentAsTarget()">Use current pos</button>
+        <button type="button" class="danger" onclick="clearGotoTarget()">Delete target</button>
+      </div>
+      <button type="button" class="primary" id="btnGoTo" onclick="goToPoint()">Go to point</button>
+    </div>
+
+    <div id="panelMISSION" class="task-panel">
+      <div class="btn-row">
+        <button type="button" class="primary" id="btnExecuteMission" onclick="executeMission()">▶ Run mission</button>
+        <button type="button" class="danger" onclick="stopMission()">■ Stop</button>
+      </div>
+      <div class="btn-row">
+        <button type="button" onclick="deleteLastWaypoint()">Delete last</button>
+        <button type="button" onclick="deleteSelectedWaypoint()">Delete selected</button>
+        <button type="button" class="danger" onclick="clearWaypoints()">Clear all</button>
+      </div>
+      <div class="params-row">
+        <div class="param-group">
+          <label>WP speed (m/s)</label>
+          <input id="defaultVel" type="number" step="0.01" value="0.15" min="0.01" max="1.0">
+        </div>
+        <div class="param-group">
+          <label>Dwell (s)</label>
+          <input id="defaultDwell" type="number" step="0.1" value="0.0" min="0">
+        </div>
+      </div>
+      <div class="ws-row">
+        <label>Workspace (m)</label>
+        <input id="ws" type="number" step="0.01" value="1.0" min="0.1" max="5.0" onchange="resizeCanvas()">
+      </div>
+      <p style="font-size:10px;color:var(--text-dim);line-height:1.4;margin:0">
+        Click map to add · click WP to select · drag to move · right-click or Del to remove
+      </p>
+    </div>
+
+    <select id="modeSelect" onchange="onModeSelectChanged()" style="display:none">
+      <option value="IDLE">IDLE</option>
+      <option value="JOG">JOG</option>
+      <option value="MISSION">MISSION</option>
+      <option value="TRAJ">TRAJ</option>
+      <option value="CSV">CSV</option>
+    </select>
+
+    <div id="panelCSV" class="task-panel">
+      <div class="param-group" style="margin-top:8px">
+        <label>CSV profile</label>
+        <select id="csvSelect" onchange="onCsvSelectChanged()">
+          <option value="">No CSV files found</option>
+        </select>
+      </div>
+      <div class="param-group" style="margin-top:8px">
+        <label>CSV path</label>
+        <input id="csvPath" type="text" value="/home/sanjay/crane_ws/csv/test_x.csv">
+      </div>
+      <div class="btn-row" style="margin-top:8px">
+        <button id="btnCsvLog" type="button" onclick="startCsvLog()">Start CSV logger</button>
+        <button id="btnStartCsv" type="button" onclick="startCsvProfile()">Start CSV</button>
+        <button id="btnStopCsvLog" type="button" onclick="stopCsvLog()">Stop CSV logger</button>
+      </div>
+      <p id="csvLogStatus" style="font-size:10px;color:var(--text-dim);line-height:1.4;margin:6px 0 0">
+        CSV log: not started
+      </p>
+    </div>
+
+    <div id="panelTRAJ" class="task-panel">
+      <button id="btnArmTraj" type="button" class="primary" onclick="apiAction('traj_arm')">Arm TRAJ</button>
+    </div>
+
+    <div class="estop-panel">
+      <label>Emergency stop</label>
+      <button type="button" class="btn-estop" onclick="apiAction('estop')">Emergency stop</button>
+      <button type="button" class="btn-estop-clear" onclick="apiAction('clear_estop')">Clear E-stop · then Enable</button>
+    </div>
+  </div>
+
+  <div id="wpSection">
+    <div id="wpHeader">
+      <span>Waypoints</span>
+      <span id="wpCount">0 points</span>
+    </div>
+    <div style="overflow:auto;flex:1;">
+      <table id="wpTable">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>X (m)</th>
+            <th>Y (m)</th>
+            <th>V (m/s)</th>
+            <th>Dw (s)</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="center">
+  <div id="toolbar">
+    <span class="tool-label">Cart XY (m)</span>
+    <div class="toolbar-sep"></div>
+    <span class="tool-label" id="mapToolHint">Click map → set go-to target</span>
+    <div class="toolbar-sep"></div>
+    <span class="tool-label" id="toolbarInfo">—</span>
+    <div class="toolbar-sep"></div>
+    <span class="tool-label" id="modeBadge">GOTO</span>
+    <div class="toolbar-sep"></div>
+    <button type="button" class="toolbar-btn danger" id="btnMapDelete" onclick="deleteMapSelection()" title="Delete target or selected waypoint (Del)">Delete</button>
+  </div>
+
+  <div id="workArea">
+    <div id="mainCol">
+      <div id="canvasWrap">
+        <div id="canvasLabel">WORKSPACE<span id="canvasSub">Gantry cart X/Y — motor encoders only</span></div>
+        <canvas id="c"></canvas>
+      </div>
+    </div>
+
+    <div id="splitterV" title="Drag to resize vision / telemetry panel"></div>
+
+    <div id="rail">
+      <div id="railInner">
+        <div id="railCamera" class="rail-pane">
+          <div class="rail-title">Payload vision <span class="resize-hint">— drag edges to resize</span></div>
+          <div id="cameraBox">
+            <img id="camImg" src="" alt="" style="display:none" />
+            <div id="cameraPlaceholder">Waiting for /payload/camera/compressed…</div>
+          </div>
+          <div class="vision-toolbar">
+            <button type="button" onclick="calibratePayloadReference()" title="Reset camera and rope encoder payload reference at the current settled pose">Calibrate payload reference</button>
+          </div>
+          <div id="visionCamPanel" class="enc-panel">
+            <div class="enc-cell">
+              <div class="label">Camera X</div>
+              <div class="value green" id="camX">—<span class="unit">m</span></div>
+            </div>
+            <div class="enc-cell">
+              <div class="label">Camera Y</div>
+              <div class="value green" id="camY">—<span class="unit">m</span></div>
+            </div>
+            <div class="enc-cell">
+              <div class="label">Camera Z</div>
+              <div class="value green" id="camZ">—<span class="unit">m</span></div>
+            </div>
+            <div class="enc-cell span2">
+              <div class="label">Tracker</div>
+              <div class="value dim" id="visionMeta">/payload/state cam_x,y,z</div>
+            </div>
+          </div>
+        </div>
+        <div id="splitterH" title="Drag to resize camera vs chart"></div>
+        <div id="railTelemetry" class="rail-pane">
+          <div class="rail-title">Payload encoders <span class="resize-hint">/payload/pose_e</span></div>
+          <div class="param-group">
+            <label>Rope length L (m) — zero-angle offset in Z</label>
+            <input id="ropeL" type="number" step="0.01" value="1.20" min="0.1" max="5" onchange="onRopeLChange()">
+          </div>
+          <div id="encPanel">
+            <div class="enc-cell">
+              <div class="label">Pitch</div>
+              <div class="value green" id="encPitch">0.00<span class="unit">°</span></div>
+            </div>
+            <div class="enc-cell">
+              <div class="label">Roll</div>
+              <div class="value green" id="encRoll">0.00<span class="unit">°</span></div>
+            </div>
+            <div class="enc-cell">
+              <div class="label">Δx (rel.)</div>
+              <div class="value" id="encXr">0<span class="unit">mm</span></div>
+            </div>
+            <div class="enc-cell">
+              <div class="label">Δy (rel.)</div>
+              <div class="value" id="encYr">0<span class="unit">mm</span></div>
+            </div>
+            <div class="enc-cell">
+              <div class="label">Δz (rel.)</div>
+              <div class="value" id="encZr">1200<span class="unit">mm</span></div>
+            </div>
+            <div class="enc-cell">
+              <div class="label">In gantry XY</div>
+              <div class="value dim" id="encWorld">—</div>
+            </div>
+            <div class="enc-cell span2">
+              <div class="label">Velocity (gantry frame)</div>
+              <div class="value dim" id="encVel">vx 0 · vy 0 · vz 0 mm/s</div>
+            </div>
+          </div>
+          <div id="chartWrap">
+            <canvas id="chartC"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="hint">
+    <span><b style="color:var(--green)">●</b> Cart now</span>
+    <span><b style="color:var(--accent2)">●</b> Go-to target</span>
+    <span><b style="color:#0066ff">●</b> Mission WP</span>
+    <span style="margin-left:auto" id="errLine">Connecting to dashboard…</span>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const chartC = document.getElementById('chartC');
+const chartCtx = chartC.getContext('2d');
+const visionChartC = document.getElementById('visionChartC');
+const visionChartCtx = visionChartC ? visionChartC.getContext('2d') : null;
+
+let workspace = 1.0;
+let waypoints = [];
+let pose = { x: 0.12, y: 0.08 };
+let mission_running = false;
+let connected = false;
+let previewMode = true;
+let gantryMode = 'IDLE';
+let gantryEnabled = false;
+let gantryHomed = false;
+let gantryHomingActive = false;
+let gantryHomingStatus = '';
+let gantryEstop = false;
+/** While set, poll must not overwrite mode UI with stale /gantry/state. */
+let pendingModeTarget = null;
+let pendingModeSince = 0;
+let csvStaged = false;
+let uiModeApplied = 'GOTO';
+let userTask = 'goto';
+let mapTool = 'goto';
+let gotoTarget = null;
+let dragIdx = -1;
+let hoverIdx = -1;
+let selectedWpIdx = -1;
+let gantryLive = false;
+let gantryStaleS = null;
+let payloadLive = false;
+let cameraLive = false;
+let positionSource = 'gantry';
+let pollFailStreak = 0;
+let hadLiveGantry = false;
+const POLL_FAIL_DISCONNECT = 8;
+const STARTUP_GRACE_MS = 2000;
+const pageLoadTime = performance.now();
+let cameraBusy = false;
+let lastCameraFrameId = -1;
+let serverCameraFrameId = 0;
+let lastCameraBlobUrl = null;
+let lastCameraDisplayTime = 0;
+let cameraUseMjpeg = true;
+let stickyGotoError = '';
+let lastGoodState = null;
+let gantryEverReceived = false;
+let wasHomingActive = false;
+const CAMERA_FORCE_REFRESH_MS = 300;
+const POLL_DISCONNECT_AFTER = 25;
+
+const DEG2RAD = Math.PI / 180;
+const chartHistory = { pitch: [], roll: [], t0: performance.now() };
+const chartDegRange = 20;
+const visionHistory = [];
+const visionRange = { x: 1.0, z: 3.0 };
+/** Display-only EMA (tracker also smooths /payload/state). */
+const visionPlotSmooth = { x: null, z: null, alpha: 0.42 };
+/** 'gantry' → gantry_x/z; 'camera' → cam_x/z (bench calibration). */
+let visionPlotAxes = 'gantry';
+const VISION_MIN_SPAN_M = 0.28;
+const VISION_MARGIN_FRAC = 0.12;
+/** Always show this much of the axes around session zero (m). */
+const VISION_ZERO_EXTENT_M = 0.18;
+let encoder = {
+  pitch_deg: 0, roll_deg: 0,
+  x_rel_m: 0, y_rel_m: 0, z_rel_m: 1.2,
+  vx_m_s: 0, vy_m_s: 0, vz_m_s: 0,
+};
+let encPrev = { pitch_deg: 0, roll_deg: 0, t: 0 };
+
+function getRopeL() {
+  return Math.max(0.05, parseFloat(document.getElementById('ropeL').value || '1.2'));
+}
+
+function payloadRelativeFromAngles(pitchDeg, rollDeg, ropeL_m) {
+  const p = pitchDeg * DEG2RAD;
+  const r = rollDeg * DEG2RAD;
+  const x_rel = ropeL_m * Math.sin(p);
+  const y_rel = ropeL_m * Math.sin(r);
+  const z_rel = -ropeL_m * Math.cos(p) * Math.cos(r);
+  return { x_rel, y_rel, z_rel };
+}
+
+function payloadVelocityFromAngles(pitchDeg, rollDeg, t_sec) {
+  const dt = t_sec - encPrev.t;
+  if (dt < 0.015 || dt > 2.0) {
+    encPrev = { pitch_deg: pitchDeg, roll_deg: rollDeg, t: t_sec };
+    return { vx: 0, vy: 0, vz: 0 };
+  }
+  const L = getRopeL();
+  const p = pitchDeg * DEG2RAD;
+  const r = rollDeg * DEG2RAD;
+  const dp = ((pitchDeg - encPrev.pitch_deg) * DEG2RAD) / dt;
+  const dr = ((rollDeg - encPrev.roll_deg) * DEG2RAD) / dt;
+  const vx = L * Math.cos(p) * dp;
+  const vy = L * Math.cos(r) * dr;
+  const vz = L * (Math.sin(p) * Math.cos(r) * dp + Math.cos(p) * Math.sin(r) * dr);
+  encPrev = { pitch_deg: pitchDeg, roll_deg: rollDeg, t: t_sec };
+  return { vx, vy, vz };
+}
+
+function applyEncoderSample(pitchDeg, rollDeg, tSec, serverRel) {
+  const L = getRopeL();
+  encoder.pitch_deg = pitchDeg;
+  encoder.roll_deg = rollDeg;
+  // Prefer the backend /payload/pose_e_rel (single source of truth); fall back
+  // to the local formula only when the topic is unavailable.
+  if (serverRel && Number.isFinite(serverRel.x_rel_m)) {
+    encoder.x_rel_m = serverRel.x_rel_m;
+    encoder.y_rel_m = serverRel.y_rel_m;
+    encoder.z_rel_m = serverRel.z_rel_m;
+    encoder.vx_m_s = Number.isFinite(serverRel.vx_rel_m_s) ? serverRel.vx_rel_m_s : 0;
+    encoder.vy_m_s = Number.isFinite(serverRel.vy_rel_m_s) ? serverRel.vy_rel_m_s : 0;
+    encoder.vz_m_s = Number.isFinite(serverRel.vz_rel_m_s) ? serverRel.vz_rel_m_s : 0;
+    encPrev = { pitch_deg: pitchDeg, roll_deg: rollDeg, t: tSec };
+  } else {
+    const rel = payloadRelativeFromAngles(pitchDeg, rollDeg, L);
+    const vel = payloadVelocityFromAngles(pitchDeg, rollDeg, tSec);
+    encoder.x_rel_m = rel.x_rel;
+    encoder.y_rel_m = rel.y_rel;
+    encoder.z_rel_m = rel.z_rel;
+    encoder.vx_m_s = vel.vx;
+    encoder.vy_m_s = vel.vy;
+    encoder.vz_m_s = vel.vz;
+  }
+  updateEncoderUI();
+  chartHistory.pitch.push(pitchDeg);
+  chartHistory.roll.push(rollDeg);
+  if (chartHistory.pitch.length > 120) chartHistory.pitch.shift();
+  if (chartHistory.roll.length > 120) chartHistory.roll.shift();
+  drawChart();
+}
+
+function updateEncoderUI() {
+  const fmtMm = v => `${(v * 1000).toFixed(1)}`;
+  const fmtVel = v => `${(v * 1000).toFixed(0)}`;
+  document.getElementById('encPitch').innerHTML =
+    `${encoder.pitch_deg.toFixed(2)}<span class="unit">°</span>`;
+  document.getElementById('encRoll').innerHTML =
+    `${encoder.roll_deg.toFixed(2)}<span class="unit">°</span>`;
+  document.getElementById('encXr').innerHTML =
+    `${fmtMm(encoder.x_rel_m)}<span class="unit">mm</span>`;
+  document.getElementById('encYr').innerHTML =
+    `${fmtMm(encoder.y_rel_m)}<span class="unit">mm</span>`;
+  document.getElementById('encZr').innerHTML =
+    `${fmtMm(encoder.z_rel_m)}<span class="unit">mm</span>`;
+  const xw = pose.x + encoder.x_rel_m;
+  const yw = pose.y + encoder.y_rel_m;
+  document.getElementById('encWorld').textContent =
+    `x ${fmtMm(xw)} mm · y ${fmtMm(yw)} mm`;
+  document.getElementById('encVel').textContent =
+    `vx ${fmtVel(encoder.vx_m_s)} · vy ${fmtVel(encoder.vy_m_s)} · vz ${fmtVel(encoder.vz_m_s)} mm/s`;
+}
+
+async function onRopeLChange() {
+  const ropeLength = getRopeL();
+  applyEncoderSample(encoder.pitch_deg, encoder.roll_deg, encPrev.t || performance.now() / 1000);
+  try {
+    const res = await apiPost('/action/set_rope_length', { rope_length_m: ropeLength });
+    const el = document.getElementById('errLine');
+    if (res.status === 'ok') {
+      el.textContent = `Rope length set to ${ropeLength.toFixed(2)} m`;
+      setTimeout(() => {
+        if (el.textContent === `Rope length set to ${ropeLength.toFixed(2)} m`) el.textContent = '';
+      }, 1800);
+    } else {
+      el.textContent = res.message || 'Failed to update rope length';
+    }
+  } catch (e) {
+    document.getElementById('errLine').textContent =
+      'Rope length update needs encoder node running';
+  }
+}
+
+function updateStatusChips() {
+  const conn = document.getElementById('chipConn');
+  const en = document.getElementById('chipEn');
+  const hm = document.getElementById('chipHome');
+  const md = document.getElementById('chipMode');
+  if (!conn) return;
+  if (!connected) {
+    conn.textContent = 'offline';
+    conn.className = 'chip bad';
+  } else if (gantryLive) {
+    conn.textContent = 'online';
+    conn.className = 'chip ok';
+  } else if (gantryEverReceived || hadLiveGantry || payloadLive) {
+    conn.textContent = 'gantry stale';
+    conn.className = 'chip warn';
+  } else {
+    conn.textContent = 'no gantry';
+    conn.className = 'chip warn';
+  }
+  en.textContent = gantryEnabled ? 'motors on' : 'motors off';
+  en.className = 'chip ' + (gantryEnabled ? 'ok' : '');
+  if (gantryHomingActive) {
+    hm.textContent = 'homing…';
+    hm.className = 'chip warn';
+  } else {
+    hm.textContent = gantryHomed ? 'homed' : 'not homed';
+    hm.className = 'chip ' + (gantryHomed ? 'ok' : 'warn');
+  }
+  md.textContent = gantryMode || '—';
+  md.className = 'chip';
+}
+
+function updateMapToolbarHint() {
+  const hints = {
+    jog: 'Jog mode — map clicks disabled',
+    goto: 'Click map → target · right-click or Delete removes target',
+    mission: 'Click → add WP · select · Delete / right-click removes',
+    csv: 'CSV profile mode',
+    traj: 'TRAJ command mode',
+  };
+  document.getElementById('mapToolHint').textContent = hints[userTask] || '';
+  document.getElementById('modeBadge').textContent = userTask.toUpperCase();
+}
+
+function setTask(task) {
+  userTask = task;
+  mapTool = (task === 'csv' || task === 'traj') ? 'none' : task;
+  document.querySelectorAll('.task-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.task === task);
+  });
+  document.querySelectorAll('.task-panel').forEach(p => p.classList.remove('active'));
+  const panelId = {
+    jog: 'panelJOG',
+    goto: 'panelGOTO',
+    mission: 'panelMISSION',
+    csv: 'panelCSV',
+    traj: 'panelTRAJ',
+  }[task];
+  const panel = document.getElementById(panelId);
+  if (panel) panel.classList.add('active');
+  const modeByTask = { jog: 'JOG', goto: 'MISSION', mission: 'MISSION', csv: 'CSV', traj: 'TRAJ' };
+  const sel = document.getElementById('modeSelect');
+  if (sel && modeByTask[task]) sel.value = modeByTask[task];
+  updateMapToolbarHint();
+  if (task === 'jog' && connected) {
+    syncBackendMode('JOG');
+  } else if (task === 'traj') {
+    csvStaged = false;
+  } else if (task === 'csv') {
+    csvStaged = true;
+  }
+  updateAdvancedControls();
+}
+
+function setGotoTarget(x, y) {
+  gotoTarget = {
+    x: clamp(x, 0, workspace),
+    y: clamp(y, 0, workspace),
+  };
+  document.getElementById('tgtX').value = gotoTarget.x.toFixed(3);
+  document.getElementById('tgtY').value = gotoTarget.y.toFixed(3);
+}
+
+function onTargetTyped() {
+  const x = parseFloat(document.getElementById('tgtX').value);
+  const y = parseFloat(document.getElementById('tgtY').value);
+  if (Number.isFinite(x) && Number.isFinite(y)) {
+    gotoTarget = { x: clamp(x, 0, workspace), y: clamp(y, 0, workspace) };
+  }
+}
+
+function useCurrentAsTarget() {
+  setGotoTarget(pose.x, pose.y);
+}
+
+function clearGotoTarget() {
+  gotoTarget = null;
+  document.getElementById('tgtX').value = '';
+  document.getElementById('tgtY').value = '';
+}
+
+function applyModeUI(mode) {
+  const m = String(mode || 'IDLE').toUpperCase();
+  const sel = document.getElementById('modeSelect');
+  if (sel) sel.value = m;
+  gantryMode = m;
+  updateAdvancedControls();
+  updateStatusChips();
+}
+
+function selectedUiMode() {
+  return String(document.getElementById('modeSelect')?.value || gantryMode || 'IDLE').toUpperCase();
+}
+
+function updateAdvancedControls() {
+  const armTraj = document.getElementById('btnArmTraj');
+  const csvLog = document.getElementById('btnCsvLog');
+  const csvStart = document.getElementById('btnStartCsv');
+  const csvStopLog = document.getElementById('btnStopCsvLog');
+  const showCsv = userTask === 'csv';
+  const showTraj = userTask === 'traj';
+  if (armTraj) armTraj.style.display = showTraj ? '' : 'none';
+  if (csvLog) csvLog.style.display = showCsv ? '' : 'none';
+  if (csvStart) csvStart.style.display = showCsv ? '' : 'none';
+  if (csvStopLog) csvStopLog.style.display = showCsv ? '' : 'none';
+}
+
+function onModeSelectChanged() {
+  const m = document.getElementById('modeSelect').value;
+  pendingModeTarget = m;
+  pendingModeSince = performance.now();
+  updateAdvancedControls();
+  if (m === 'CSV') {
+    showErr('CSV selected — choose a profile, then press Start CSV');
+    csvStaged = true;
+    pendingModeTarget = null;
+    return;
+  }
+  csvStaged = false;
+  syncModeToBackend();
+}
+
+function onCsvSelectChanged() {
+  const sel = document.getElementById('csvSelect');
+  const path = document.getElementById('csvPath');
+  if (sel && path && sel.value) path.value = sel.value;
+}
+
+function updateCsvProfiles(profiles) {
+  const sel = document.getElementById('csvSelect');
+  const pathInput = document.getElementById('csvPath');
+  if (!sel || !pathInput || !Array.isArray(profiles)) return;
+  const previous = sel.value || pathInput.value;
+  const nextHtml = profiles.length
+    ? profiles.map(p => `<option value="${String(p.path || '').replaceAll('"', '&quot;')}">${p.name || p.path}</option>`).join('')
+    : '<option value="">No CSV files found</option>';
+  if (sel.dataset.lastHtml !== nextHtml) {
+    sel.innerHTML = nextHtml;
+    sel.dataset.lastHtml = nextHtml;
+  }
+  if (profiles.some(p => p.path === previous)) {
+    sel.value = previous;
+  } else if (profiles.length && !pathInput.value) {
+    sel.value = profiles[0].path;
+    pathInput.value = profiles[0].path;
+  }
+}
+
+function updateCsvLogStatus(csvLog) {
+  const el = document.getElementById('csvLogStatus');
+  const startBtn = document.getElementById('btnCsvLog');
+  const stopBtn = document.getElementById('btnStopCsvLog');
+  if (!el || !csvLog) return;
+  if (csvLog.active) {
+    el.textContent = `CSV log: ${csvLog.path} (${csvLog.rows || 0} rows)`;
+    if (startBtn) startBtn.disabled = true;
+    if (stopBtn) stopBtn.disabled = false;
+  } else {
+    el.textContent = `CSV log will save as: ${csvLog.path}`;
+    if (startBtn) startBtn.disabled = false;
+    if (stopBtn) stopBtn.disabled = true;
+  }
+}
+
+async function syncBackendMode(mode) {
+  const m = mode || document.getElementById('modeSelect')?.value || 'JOG';
+  const jog_preset = parseInt(document.getElementById('jogPreset').value || '1', 10);
+  const csv_path = document.getElementById('csvPath')?.value?.trim() || '';
+  pendingModeTarget = m;
+  pendingModeSince = performance.now();
+  if (m === 'CSV') {
+    if (!csv_path) {
+      showErr('Select a CSV profile first');
+      pendingModeTarget = null;
+      return false;
+    }
+    showErr(`CSV staged: ${csv_path}`);
+    csvStaged = true;
+    pendingModeTarget = null;
+    return true;
+  }
+  csvStaged = false;
+  if (['JOG', 'MISSION'].includes(m) && connected && !gantryEnabled && !gantryEstop) {
+    showErr(`${m} needs Enable first`);
+    pendingModeTarget = null;
+    return false;
+  }
+  try {
+    const body = { mode: m, jog_preset };
+    if (m === 'CSV') body.csv_path = csv_path;
+    const res = await apiPost('/action/set_mode', body);
+    if (res.status === 'error') {
+      showErr(res.message || `${m} failed`);
+      pendingModeTarget = null;
+      return false;
+    }
+    applyModeUI(m);
+    clearErr();
+    return true;
+  } catch (e) {
+    showErr('Dashboard not connected');
+    pendingModeTarget = null;
+    return false;
+  }
+}
+
+async function syncModeToBackend() {
+  return syncBackendMode(document.getElementById('modeSelect').value);
+}
+
+async function startCsvLog() {
+  try {
+    const res = await apiPost('/action/start_csv_log', {});
+    if (res.status === 'error') {
+      showErr(res.message || 'CSV logger failed');
+      return false;
+    }
+    showErr(res.message || 'CSV logger started');
+    return true;
+  } catch (e) {
+    showErr('Dashboard not connected');
+    return false;
+  }
+}
+
+async function stopCsvLog() {
+  try {
+    const res = await apiPost('/action/stop_csv_log', {});
+    if (res.status === 'error') {
+      showErr(res.message || 'CSV logger failed to stop');
+      return false;
+    }
+    showErr(res.message || 'CSV logger stopped');
+    return true;
+  } catch (e) {
+    showErr('Dashboard not connected');
+    return false;
+  }
+}
+
+async function startCsvProfile() {
+  const csv_path = document.getElementById('csvPath')?.value?.trim() || '';
+  if (!csv_path) {
+    showErr('Select a CSV profile first');
+    return false;
+  }
+  if (!connected) {
+    showErr('Dashboard not connected');
+    return false;
+  }
+  if (gantryEstop) {
+    showErr('Clear E-stop first');
+    return false;
+  }
+  if (!gantryHomed) {
+    showErr('Home first, then start CSV');
+    return false;
+  }
+  if (!gantryEnabled) {
+    showErr('Enable motors first, then start CSV');
+    return false;
+  }
+  pendingModeTarget = 'CSV';
+  pendingModeSince = performance.now();
+  try {
+    const res = await apiPost('/action/set_mode', {
+      mode: 'CSV',
+      jog_preset: parseInt(document.getElementById('jogPreset').value || '1', 10),
+      csv_path,
+    });
+    if (res.status === 'error') {
+      showErr(res.message || 'CSV failed to start');
+      pendingModeTarget = null;
+      return false;
+    }
+    applyModeUI('CSV');
+    csvStaged = false;
+    showErr(`CSV started: ${csv_path}`);
+    return true;
+  } catch (e) {
+    showErr('Dashboard not connected');
+    pendingModeTarget = null;
+    return false;
+  }
+}
+
+function showErr(msg) {
+  document.getElementById('errLine').textContent = msg || '';
+}
+
+function clearErr() {
+  const el = document.getElementById('errLine');
+  if (el.textContent && !el.textContent.startsWith('E-stop')) {
+    el.textContent = '';
+  }
+}
+
+async function goToPoint() {
+  onTargetTyped();
+  if (!gotoTarget) {
+    showErr('Set a target — click the map or enter X/Y');
+    return;
+  }
+  if (!connected) {
+    showErr('Not connected to gantry');
+    return;
+  }
+  if (gantryEstop) {
+    showErr('Clear E-stop first, then Enable');
+    return;
+  }
+  if (!gantryHomed) {
+    showErr('Run Home first (chip must show homed)');
+    return;
+  }
+  stickyGotoError = '';
+  showErr(`Go to (${gotoTarget.x.toFixed(3)}, ${gotoTarget.y.toFixed(3)}) m — starting…`);
+  try {
+    const res = await apiPost('/action/goto', {
+      x: gotoTarget.x,
+      y: gotoTarget.y,
+    });
+    if (res.status === 'error') {
+      showErr(res.message || 'Go to failed');
+    }
+  } catch (e) {
+    showErr('Dashboard not connected');
+  }
+}
+
+function applyGotoStatus(gs) {
+  if (!gs || !gs.state) return;
+  const btn = document.getElementById('btnGoTo');
+  if (gs.state === 'running') {
+    stickyGotoError = '';
+    showErr(gs.message || 'Moving…');
+    if (btn) btn.disabled = true;
+  } else if (gs.state === 'error') {
+    stickyGotoError = gs.message || 'Go to failed';
+    showErr(stickyGotoError);
+    if (btn) btn.disabled = gantryHomingActive || gantryEstop || !gantryHomed;
+  } else if (gs.state === 'done') {
+    stickyGotoError = '';
+    showErr(gs.message || 'Move complete');
+    if (btn) btn.disabled = gantryHomingActive || gantryEstop || !gantryHomed;
+    setTimeout(() => {
+      const el = document.getElementById('errLine');
+      if (!stickyGotoError && el.textContent === (gs.message || 'Move complete')) {
+        el.textContent = '';
+      }
+    }, 3000);
+  } else if (gs.state === 'idle') {
+    if (btn) btn.disabled = gantryHomingActive || gantryEstop || !gantryHomed;
+  }
+}
+
+function fitCanvas() {
+  const wrap = document.getElementById('canvasWrap');
+  const padding = 48;
+  const size = Math.min(wrap.clientWidth, wrap.clientHeight) - padding;
+  canvas.width = Math.max(200, size);
+  canvas.height = Math.max(200, size);
+}
+
+function fitVisionChartCanvas() {
+  /* vision chart removed — camera X/Y/Z panel under live feed */
+}
+
+function visionSampleXZ(p) {
+  if (!p) return { x1: NaN, z1: NaN, label: '' };
+  if (visionPlotAxes === 'camera') {
+    return {
+      x1: Number(p.cam_x),
+      z1: Number(p.cam_z),
+      label: 'camera x–z',
+    };
+  }
+  const gx = Number(p.gantry_x);
+  const gz = Number(p.gantry_z);
+  const useGantry = Number.isFinite(gx) && Number.isFinite(gz) && p.frame_id === 'gantry';
+  return {
+    x1: useGantry ? gx : Number(p.x1),
+    z1: useGantry ? gz : Number(p.z1),
+    label: useGantry ? 'gantry x–z' : 'tag x1–z1',
+  };
+}
+
+function toggleVisionAxes() {
+  visionPlotAxes = visionPlotAxes === 'gantry' ? 'camera' : 'gantry';
+  visionHistory.length = 0;
+  visionPlotSmooth.x = null;
+  visionPlotSmooth.z = null;
+  const btn = document.getElementById('visionAxesBtn');
+  btn.textContent = visionPlotAxes === 'gantry'
+    ? 'Axes: gantry X–Z' : 'Axes: camera X–Z';
+  drawVisionChart();
+}
+
+async function calibratePayloadReference() {
+  try {
+    const res = await apiPost('/action/calibrate_payload', {});
+    const el = document.getElementById('errLine');
+    if (res.status === 'ok') {
+      el.textContent = res.message || 'Payload reference calibrated';
+      setTimeout(() => {
+        if (el.textContent === (res.message || 'Payload reference calibrated')) el.textContent = '';
+      }, 2500);
+    } else {
+      el.textContent = res.message || 'Calibration failed';
+    }
+  } catch (e) {
+    document.getElementById('errLine').textContent =
+      'Calibration service unavailable';
+  }
+}
+
+function applyVisionSample(p) {
+  if (!p) return;
+  const cx = Number(p.cam_x);
+  const cy = Number(p.cam_y);
+  const cz = Number(p.cam_z);
+  const fmt = v => Number.isFinite(v) ? v.toFixed(4) : '—';
+  const elX = document.getElementById('camX');
+  const elY = document.getElementById('camY');
+  const elZ = document.getElementById('camZ');
+  if (elX) elX.innerHTML = `${fmt(cx)}<span class="unit">m</span>`;
+  if (elY) elY.innerHTML = `${fmt(cy)}<span class="unit">m</span>`;
+  if (elZ) elZ.innerHTML = `${fmt(cz)}<span class="unit">m</span>`;
+  const meta = document.getElementById('visionMeta');
+  if (meta) {
+    let line = `frame ${p.frame_id || '—'}`;
+    if (p.interpolated) line += ' · INTERP';
+    if (!p.valid) line += ' · invalid';
+    meta.textContent = line;
+  }
+}
+
+function visionTopDownBounds() {
+  let xMin = Infinity, xMax = -Infinity, zMin = Infinity, zMax = -Infinity;
+  for (const pt of visionHistory) {
+    xMin = Math.min(xMin, pt.x1);
+    xMax = Math.max(xMax, pt.x1);
+    zMin = Math.min(zMin, pt.z1);
+    zMax = Math.max(zMax, pt.z1);
+  }
+  if (!Number.isFinite(xMin)) {
+    return { xMin: -0.4, xMax: 0.4, zMin: -0.4, zMax: 0.4 };
+  }
+  // Keep session origin visible; do not force symmetric range around zero.
+  xMin = Math.min(xMin, 0);
+  xMax = Math.max(xMax, 0);
+  zMin = Math.min(zMin, 0);
+  zMax = Math.max(zMax, 0);
+
+  let xSpan = xMax - xMin;
+  let zSpan = zMax - zMin;
+  if (xSpan < VISION_MIN_SPAN_M) {
+    const xc = 0.5 * (xMin + xMax);
+    xMin = xc - VISION_MIN_SPAN_M * 0.5;
+    xMax = xc + VISION_MIN_SPAN_M * 0.5;
+    xSpan = VISION_MIN_SPAN_M;
+  }
+  if (zSpan < VISION_MIN_SPAN_M) {
+    const zc = 0.5 * (zMin + zMax);
+    zMin = zc - VISION_MIN_SPAN_M * 0.5;
+    zMax = zc + VISION_MIN_SPAN_M * 0.5;
+    zSpan = VISION_MIN_SPAN_M;
+  }
+  // Session zero always in frame.
+  xMin = Math.min(xMin, -VISION_ZERO_EXTENT_M);
+  xMax = Math.max(xMax, VISION_ZERO_EXTENT_M);
+  zMin = Math.min(zMin, -VISION_ZERO_EXTENT_M);
+  zMax = Math.max(zMax, VISION_ZERO_EXTENT_M);
+  xSpan = xMax - xMin;
+  zSpan = zMax - zMin;
+
+  const xPad = Math.max(0.08, xSpan * VISION_MARGIN_FRAC);
+  const zPadTop = Math.max(0.06, zSpan * VISION_MARGIN_FRAC);
+  const zPadBot = Math.max(0.14, zSpan * 0.32);
+  return {
+    xMin: xMin - xPad,
+    xMax: xMax + xPad,
+    zMin: zMin - zPadBot,
+    zMax: zMax + zPadTop,
+  };
+}
+
+/** Top-down: +x right, +z up on screen (extra bottom inset lifts the trace). */
+function visionChartInsets() {
+  return { left: 26, right: 14, top: 12, bottom: 36 };
+}
+
+function visionDataToScreen(x1, z1, w, h, b) {
+  const ins = visionChartInsets();
+  const dotR = 5;
+  const pw = Math.max(1, w - ins.left - ins.right);
+  const ph = Math.max(1, h - ins.top - ins.bottom);
+  const xDenom = Math.max(1e-9, b.xMax - b.xMin);
+  const zDenom = Math.max(1e-9, b.zMax - b.zMin);
+  let px = ins.left + ((x1 - b.xMin) / xDenom) * pw;
+  let py = ins.top + (1 - (z1 - b.zMin) / zDenom) * ph;
+  px = Math.max(ins.left + dotR, Math.min(w - ins.right - dotR, px));
+  py = Math.max(ins.top + dotR, Math.min(h - ins.bottom - dotR, py));
+  return { px, py };
+}
+
+function drawVisionChart() {
+  const w = visionChartC.width, h = visionChartC.height;
+  if (w < 10 || h < 10) return;
+  const b = visionTopDownBounds();
+  visionChartCtx.fillStyle = '#090c12';
+  visionChartCtx.fillRect(0, 0, w, h);
+
+  visionChartCtx.strokeStyle = '#151c2a';
+  visionChartCtx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const x1 = b.xMin + (i / 4) * (b.xMax - b.xMin);
+    const z1 = b.zMin + (i / 4) * (b.zMax - b.zMin);
+    const pTop = visionDataToScreen(x1, b.zMax, w, h, b);
+    const pBot = visionDataToScreen(x1, b.zMin, w, h, b);
+    visionChartCtx.beginPath();
+    visionChartCtx.moveTo(pTop.px, pTop.py);
+    visionChartCtx.lineTo(pBot.px, pBot.py);
+    visionChartCtx.stroke();
+    const pL = visionDataToScreen(b.xMin, z1, w, h, b);
+    const pR = visionDataToScreen(b.xMax, z1, w, h, b);
+    visionChartCtx.beginPath();
+    visionChartCtx.moveTo(pL.px, pL.py);
+    visionChartCtx.lineTo(pR.px, pR.py);
+    visionChartCtx.stroke();
+  }
+
+  const pOrigin = visionDataToScreen(0, 0, w, h, b);
+  if (b.xMin <= 0 && b.xMax >= 0) {
+    const p0 = visionDataToScreen(0, b.zMin, w, h, b);
+    const p1 = visionDataToScreen(0, b.zMax, w, h, b);
+    visionChartCtx.strokeStyle = '#4a6080';
+    visionChartCtx.lineWidth = 1.25;
+    visionChartCtx.beginPath();
+    visionChartCtx.moveTo(p0.px, p0.py);
+    visionChartCtx.lineTo(p1.px, p1.py);
+    visionChartCtx.stroke();
+  }
+  if (b.zMin <= 0 && b.zMax >= 0) {
+    const p0 = visionDataToScreen(b.xMin, 0, w, h, b);
+    const p1 = visionDataToScreen(b.xMax, 0, w, h, b);
+    visionChartCtx.beginPath();
+    visionChartCtx.moveTo(p0.px, p0.py);
+    visionChartCtx.lineTo(p1.px, p1.py);
+    visionChartCtx.stroke();
+  }
+  visionChartCtx.fillStyle = '#6a8ab0';
+  visionChartCtx.font = `9px ${getComputedStyle(document.body).fontFamily}`;
+  visionChartCtx.textAlign = 'left';
+  visionChartCtx.textBaseline = 'top';
+  visionChartCtx.fillText('0', pOrigin.px + 3, pOrigin.py + 2);
+  visionChartCtx.strokeStyle = '#5a7a9a';
+  visionChartCtx.lineWidth = 1;
+  const cross = 5;
+  visionChartCtx.beginPath();
+  visionChartCtx.moveTo(pOrigin.px - cross, pOrigin.py);
+  visionChartCtx.lineTo(pOrigin.px + cross, pOrigin.py);
+  visionChartCtx.moveTo(pOrigin.px, pOrigin.py - cross);
+  visionChartCtx.lineTo(pOrigin.px, pOrigin.py + cross);
+  visionChartCtx.stroke();
+
+  if (visionHistory.length >= 2) {
+    visionChartCtx.beginPath();
+    visionChartCtx.strokeStyle = 'rgba(0, 212, 255, 0.65)';
+    visionChartCtx.lineWidth = 2;
+    visionChartCtx.lineJoin = 'round';
+    visionChartCtx.lineCap = 'round';
+    for (let i = 0; i < visionHistory.length; i++) {
+      const p = visionDataToScreen(visionHistory[i].x1, visionHistory[i].z1, w, h, b);
+      if (i === 0) visionChartCtx.moveTo(p.px, p.py);
+      else visionChartCtx.lineTo(p.px, p.py);
+    }
+    visionChartCtx.stroke();
+  }
+  for (let i = 0; i < visionHistory.length; i++) {
+    const pt = visionHistory[i];
+    const p = visionDataToScreen(pt.x1, pt.z1, w, h, b);
+    const last = i === visionHistory.length - 1;
+    visionChartCtx.fillStyle = last ? '#00e87a' : '#3d5a78';
+    visionChartCtx.beginPath();
+    visionChartCtx.arc(p.px, p.py, last ? 4 : 2.5, 0, Math.PI * 2);
+    visionChartCtx.fill();
+  }
+
+  visionChartCtx.fillStyle = '#3a4a66';
+  visionChartCtx.font = `9px ${getComputedStyle(document.body).fontFamily}`;
+  visionChartCtx.textAlign = 'left';
+  const ins = visionChartInsets();
+  const xLbl = visionPlotAxes === 'camera' ? 'cam x →' : 'gantry x →';
+  const zLbl = visionPlotAxes === 'camera' ? '↑ cam z' : '↑ swing z';
+  visionChartCtx.fillText(xLbl, ins.left, h - ins.bottom + 4);
+  visionChartCtx.textAlign = 'right';
+  visionChartCtx.fillText(zLbl, w - ins.right, ins.top);
+}
+
+function fitChartCanvas() {
+  const wrap = document.getElementById('chartWrap');
+  if (!wrap) return;
+  const rect = wrap.getBoundingClientRect();
+  const w = Math.max(200, Math.floor(rect.width));
+  const h = Math.max(100, Math.floor(rect.height));
+  if (chartC.width !== w || chartC.height !== h) {
+    chartC.width = w;
+    chartC.height = h;
+    drawChart();
+  }
+}
+
+function applyLayoutPrefs() {
+  try {
+    const rw = localStorage.getItem('crane_ops_rail_w');
+    const ch = localStorage.getItem('crane_ops_camera_h');
+    if (rw) document.documentElement.style.setProperty('--rail-w', rw);
+    if (ch) document.documentElement.style.setProperty('--camera-pane-h', ch);
+  } catch (e) { /* ignore */ }
+}
+
+function saveLayoutPrefs() {
+  try {
+    const rw = getComputedStyle(document.documentElement).getPropertyValue('--rail-w').trim();
+    const ch = getComputedStyle(document.documentElement).getPropertyValue('--camera-pane-h').trim();
+    if (rw) localStorage.setItem('crane_ops_rail_w', rw);
+    if (ch) localStorage.setItem('crane_ops_camera_h', ch);
+  } catch (e) { /* ignore */ }
+}
+
+function setupSplitters() {
+  const workArea = document.getElementById('workArea');
+  const rail = document.getElementById('rail');
+  const splitterV = document.getElementById('splitterV');
+  const splitterH = document.getElementById('splitterH');
+  const railInner = document.getElementById('railInner');
+
+  splitterV.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    splitterV.classList.add('dragging');
+    const startX = e.clientX;
+    const startW = rail.getBoundingClientRect().width;
+    const minW = 280;
+    const maxW = Math.min(window.innerWidth * 0.65, workArea.clientWidth - 320);
+
+    function onMove(ev) {
+      const dw = startX - ev.clientX;
+      const w = clamp(startW + dw, minW, maxW);
+      document.documentElement.style.setProperty('--rail-w', `${w}px`);
+      fitCanvas();
+      fitChartCanvas();
+      fitVisionChartCanvas();
+    }
+    function onUp() {
+      splitterV.classList.remove('dragging');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      saveLayoutPrefs();
+      fitCanvas();
+      fitChartCanvas();
+      fitVisionChartCanvas();
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+
+  splitterH.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    splitterH.classList.add('dragging');
+    const startY = e.clientY;
+    const innerH = railInner.getBoundingClientRect().height - splitterH.offsetHeight;
+    const startPct = (document.getElementById('railCamera').getBoundingClientRect().height / innerH) * 100;
+
+    function onMove(ev) {
+      const dy = ev.clientY - startY;
+      const pct = clamp(startPct + (dy / innerH) * 100, 25, 75);
+      document.documentElement.style.setProperty('--camera-pane-h', `${pct}%`);
+      fitChartCanvas();
+      fitVisionChartCanvas();
+    }
+    function onUp() {
+      splitterH.classList.remove('dragging');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      saveLayoutPrefs();
+      fitChartCanvas();
+      fitVisionChartCanvas();
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+}
+
+window.addEventListener('resize', () => {
+  fitCanvas(); fitChartCanvas(); fitVisionChartCanvas();
+});
+applyLayoutPrefs();
+fitCanvas();
+
+function toPix(xm, ym) {
+  const m = 36;
+  const w = canvas.width - 2 * m;
+  const h = canvas.height - 2 * m;
+  const px = m + (xm / workspace) * w;
+  const py = canvas.height - (m + (ym / workspace) * h);
+  return { px, py };
+}
+
+function toMeters(px, py) {
+  const m = 36;
+  const w = canvas.width - 2 * m;
+  const h = canvas.height - 2 * m;
+  const xm = ((px - m) / w) * workspace;
+  const ym = ((canvas.height - py - m) / h) * workspace;
+  return { x: clamp(xm, 0, workspace), y: clamp(ym, 0, workspace) };
+}
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+function asBool(v) {
+  return v === true || v === 1 || v === 'true' || v === '1';
+}
+
+function applyPositionFromState(pos) {
+  if (!pos || typeof pos !== 'object') return;
+  const x = Number(pos.x);
+  const y = Number(pos.y);
+  if (Number.isFinite(x) && Number.isFinite(y)) {
+    pose.x = x;
+    pose.y = y;
+  }
+}
+
+function updateHomedPoseUI() {
+  const el = document.getElementById('pHomed');
+  if (!el) return;
+  if (!connected) {
+    el.textContent = '—';
+    el.style.color = 'var(--text-dim)';
+    return;
+  }
+  if (gantryHomingActive) {
+    el.textContent = 'homing…';
+    el.style.color = 'var(--yellow)';
+    return;
+  }
+  const stale = !gantryLive && (hadLiveGantry || gantryEverReceived);
+  const suffix = stale ? ' (stale)' : '';
+  if (!gantryEverReceived && !hadLiveGantry) {
+    el.textContent = 'no data';
+    el.style.color = 'var(--yellow)';
+    return;
+  }
+  el.textContent = (gantryHomed ? 'yes' : 'no') + suffix;
+  el.style.color = gantryHomed ? 'var(--green)' : 'var(--yellow)';
+}
+
+function applyStateFromPoll(s) {
+  if (!s) return;
+  applyPositionFromState(s.position);
+  mission_running = asBool(s.mission_running);
+  gantryLive = ('gantry_live' in s) ? asBool(s.gantry_live) : true;
+  gantryEverReceived = asBool(s.gantry_ever_received) || gantryLive;
+  gantryStaleS = s.gantry_stale_s;
+  payloadLive = asBool(s.payload_live);
+  cameraLive = asBool(s.camera_live);
+  if (typeof s.camera_frame_id === 'number') {
+    serverCameraFrameId = s.camera_frame_id;
+  }
+  positionSource = s.position_source || 'gantry';
+  if (gantryLive) hadLiveGantry = true;
+  if (gantryEverReceived) hadLiveGantry = true;
+  if (s.workspace_m) {
+    workspace = s.workspace_m;
+    document.getElementById('ws').value = workspace.toFixed(2);
+  }
+  gantryEnabled = asBool(s.enabled);
+  gantryHomed = asBool(s.homed);
+  gantryHomingActive = asBool(s.homing_active);
+  gantryHomingStatus = s.homing_status || '';
+  gantryEstop = asBool(s.estop);
+  if (s.mode) {
+    gantryMode = String(s.mode).toUpperCase();
+  }
+  document.getElementById('pX').innerHTML = `${pose.x.toFixed(3)}<span class="unit">m</span>`;
+  document.getElementById('pY').innerHTML = `${pose.y.toFixed(3)}<span class="unit">m</span>`;
+  const poseNote = positionSource === 'payload' ? ' · payload xy' : '';
+  document.getElementById('poseLine').textContent =
+    new Date().toLocaleTimeString() + poseNote;
+  const meta = document.getElementById('visionMeta');
+  if (meta) {
+    if (s.stack_sync_live && s.stack_sync_hz != null) {
+      const sync = s.pose_rates_synced ? 'synced' : 'drift';
+      let line = `Stack ${Number(s.stack_sync_hz).toFixed(0)} Hz (${sync}, vision-led)`;
+      if (typeof s.payload_hz === 'number') line += ` · payload ${s.payload_hz}`;
+      if (typeof s.gantry_hz === 'number') line += ` · gantry ${s.gantry_hz}`;
+      if (typeof s.pose_e_hz === 'number' && s.pose_e_live) line += ` · enc ${s.pose_e_hz}`;
+      meta.textContent = line;
+    } else if (typeof s.payload_hz === 'number') {
+      meta.textContent = `/payload/state ~${s.payload_hz} Hz`;
+    }
+  }
+}
+
+function hitTestWaypoint(mx, my, radiusPx) {
+  for (let i = waypoints.length - 1; i >= 0; i--) {
+    const p = toPix(waypoints[i].x, waypoints[i].y);
+    if (Math.hypot(p.px - mx, p.py - my) < radiusPx) return i;
+  }
+  return -1;
+}
+
+function hitTestGotoTarget(mx, my, radiusPx) {
+  if (!gotoTarget) return false;
+  const t = toPix(gotoTarget.x, gotoTarget.y);
+  return Math.hypot(t.px - mx, t.py - my) < radiusPx;
+}
+
+function deleteMapSelection() {
+  if (mapTool === 'goto' && gotoTarget) {
+    clearGotoTarget();
+    showErr('Go-to target removed');
+    return;
+  }
+  if (mapTool === 'mission') {
+    if (selectedWpIdx >= 0 && selectedWpIdx < waypoints.length) {
+      deleteWp(selectedWpIdx);
+      selectedWpIdx = -1;
+      showErr('Waypoint removed');
+      return;
+    }
+    if (hoverIdx >= 0) {
+      deleteWp(hoverIdx);
+      showErr('Waypoint removed');
+    }
+  }
+}
+
+function deleteSelectedWaypoint() {
+  if (selectedWpIdx < 0) {
+    showErr('Click a waypoint on the map to select it first');
+    return;
+  }
+  deleteWp(selectedWpIdx);
+  selectedWpIdx = -1;
+}
+
+function deleteLastWaypoint() {
+  if (!waypoints.length) {
+    showErr('No waypoints to delete');
+    return;
+  }
+  deleteWp(waypoints.length - 1);
+  selectedWpIdx = -1;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const m = 36;
+  const cw = canvas.width, ch = canvas.height;
+
+  ctx.fillStyle = '#090c12';
+  ctx.fillRect(0, 0, cw, ch);
+
+  ctx.fillStyle = '#1a2236';
+  for (let i = 0; i <= 10; i++) {
+    for (let j = 0; j <= 10; j++) {
+      const px = m + (i / 10) * (cw - 2 * m);
+      const py = m + (j / 10) * (ch - 2 * m);
+      ctx.beginPath();
+      ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  ctx.strokeStyle = '#151c2a';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 10; i++) {
+    const t = i / 10;
+    const x = m + t * (cw - 2 * m);
+    const y = m + t * (ch - 2 * m);
+    ctx.beginPath(); ctx.moveTo(x, m); ctx.lineTo(x, ch - m); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(m, y); ctx.lineTo(cw - m, y); ctx.stroke();
+  }
+
+  ctx.fillStyle = '#2a3550';
+  ctx.font = `10px ${getComputedStyle(document.body).fontFamily}`;
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= 5; i++) {
+    const v = (i / 5 * workspace).toFixed(2);
+    const px = m + (i / 5) * (cw - 2 * m);
+    ctx.fillText(v, px, ch - m + 14);
+    ctx.fillText(v, m - 10, ch - (m + (i / 5) * (ch - 2 * m)));
+  }
+
+  ctx.strokeStyle = '#1e2d48';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(m, m, cw - 2 * m, ch - 2 * m);
+
+  if (waypoints.length > 1) {
+    ctx.beginPath();
+    const s = toPix(waypoints[0].x, waypoints[0].y);
+    ctx.moveTo(s.px, s.py);
+    for (let i = 1; i < waypoints.length; i++) {
+      const p = toPix(waypoints[i].x, waypoints[i].y);
+      ctx.lineTo(p.px, p.py);
+    }
+    ctx.strokeStyle = 'rgba(0,212,255,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  if (gotoTarget) {
+    const t = toPix(gotoTarget.x, gotoTarget.y);
+    ctx.strokeStyle = 'rgba(255,107,53,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    const lp = toPix(pose.x, pose.y);
+    ctx.beginPath();
+    ctx.moveTo(lp.px, lp.py);
+    ctx.lineTo(t.px, t.py);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(t.px, t.py, 10, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ff6b35';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(t.px, t.py, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff6b35';
+    ctx.fill();
+    ctx.fillStyle = '#ff6b35';
+    ctx.font = `bold 10px ${getComputedStyle(document.body).fontFamily}`;
+    ctx.textAlign = 'left';
+    ctx.fillText('TARGET', t.px + 12, t.py - 6);
+    ctx.fillText(`${gotoTarget.x.toFixed(2)}, ${gotoTarget.y.toFixed(2)}`, t.px + 12, t.py + 8);
+  }
+
+  for (let i = 0; i < waypoints.length; i++) {
+    const wp = waypoints[i];
+    const { px, py } = toPix(wp.x, wp.y);
+    const isHover = i === hoverIdx || i === dragIdx;
+    const isSelected = i === selectedWpIdx;
+    if (isHover || isSelected) {
+      ctx.beginPath();
+      ctx.arc(px, py, 14, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,107,53,0.15)';
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(px, py, 7, 0, Math.PI * 2);
+    ctx.fillStyle = (isHover || isSelected) ? '#ff6b35' : '#0066ff';
+    ctx.fill();
+    ctx.strokeStyle = (isHover || isSelected) ? 'rgba(255,107,53,0.8)' : 'rgba(0,102,255,0.8)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = (isHover || isSelected) ? '#ff6b35' : '#00d4ff';
+    ctx.font = `bold 10px ${getComputedStyle(document.body).fontFamily}`;
+    ctx.textAlign = 'left';
+    ctx.fillText(String(i + 1), px + 10, py - 8);
+    ctx.fillStyle = '#3a4a66';
+    ctx.font = `9px ${getComputedStyle(document.body).fontFamily}`;
+    ctx.fillText(`${wp.x.toFixed(2)},${wp.y.toFixed(2)}`, px + 10, py + 4);
+  }
+
+  const lp = toPix(pose.x, pose.y);
+  ctx.strokeStyle = 'rgba(0,232,122,0.3)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(lp.px - 16, lp.py); ctx.lineTo(lp.px + 16, lp.py); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(lp.px, lp.py - 16); ctx.lineTo(lp.px, lp.py + 16); ctx.stroke();
+  const grad = ctx.createRadialGradient(lp.px, lp.py, 0, lp.px, lp.py, 16);
+  grad.addColorStop(0, 'rgba(0,232,122,0.4)');
+  grad.addColorStop(1, 'rgba(0,232,122,0)');
+  ctx.beginPath();
+  ctx.arc(lp.px, lp.py, 16, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(lp.px, lp.py, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#00e87a';
+  ctx.fill();
+  ctx.fillStyle = '#00e87a';
+  ctx.font = `bold 10px ${getComputedStyle(document.body).fontFamily}`;
+  ctx.textAlign = 'left';
+  ctx.fillText('LIVE', lp.px + 10, lp.py + 4);
+
+  requestAnimationFrame(draw);
+}
+
+function degToChartY(deg, h) {
+  const yMin = -chartDegRange;
+  const yMax = chartDegRange;
+  const t = clamp(deg, yMin, yMax);
+  return h - 8 - ((t - yMin) / (yMax - yMin)) * (h - 16);
+}
+
+function drawChart() {
+  const w = chartC.width, h = chartC.height;
+  chartCtx.fillStyle = '#090c12';
+  chartCtx.fillRect(0, 0, w, h);
+  chartCtx.strokeStyle = '#151c2a';
+  chartCtx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = degToChartY(-chartDegRange + (i / 4) * (2 * chartDegRange), h);
+    chartCtx.beginPath(); chartCtx.moveTo(0, y); chartCtx.lineTo(w, y); chartCtx.stroke();
+  }
+  const zeroY = degToChartY(0, h);
+  chartCtx.strokeStyle = '#2d3a52';
+  chartCtx.beginPath(); chartCtx.moveTo(0, zeroY); chartCtx.lineTo(w, zeroY); chartCtx.stroke();
+
+  chartCtx.fillStyle = '#3a4a66';
+  chartCtx.font = `9px ${getComputedStyle(document.body).fontFamily}`;
+  chartCtx.textAlign = 'right';
+  chartCtx.fillText(`${chartDegRange}°`, w - 4, 10);
+  chartCtx.fillText(`0°`, w - 4, zeroY + 3);
+  chartCtx.fillText(`-${chartDegRange}°`, w - 4, h - 4);
+
+  const series = [
+    { data: chartHistory.pitch, color: '#00e87a', label: 'pitch' },
+    { data: chartHistory.roll, color: '#00d4ff', label: 'roll' },
+  ];
+  for (const s of series) {
+    if (s.data.length < 2) continue;
+    chartCtx.beginPath();
+    chartCtx.strokeStyle = s.color;
+    chartCtx.lineWidth = 1.5;
+    const n = s.data.length;
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * (w - 8) + 4;
+      const y = degToChartY(s.data[i], h);
+      if (i === 0) chartCtx.moveTo(x, y);
+      else chartCtx.lineTo(x, y);
+    }
+    chartCtx.stroke();
+  }
+}
+
+function pushChartSample() {
+  const t = performance.now() / 1000;
+  const pitch = 4 * Math.sin(t * 0.6);
+  const roll = 3 * Math.sin(t * 0.45 + 0.5);
+  applyEncoderSample(pitch, roll, t);
+}
+
+function renderTable() {
+  const tbody = document.querySelector('#wpTable tbody');
+  tbody.innerHTML = '';
+  waypoints.forEach((wp, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${i + 1}</td>
+      <td><input type="number" step="0.001" value="${wp.x.toFixed(3)}" style="width:72px"></td>
+      <td><input type="number" step="0.001" value="${wp.y.toFixed(3)}" style="width:72px"></td>
+      <td><input type="number" step="0.01" value="${wp.velocity.toFixed(2)}" style="width:60px"></td>
+      <td><input type="number" step="0.1" value="${wp.dwell.toFixed(1)}" style="width:52px"></td>
+      <td><button class="del-btn" onclick="deleteWp(${i})">✕</button></td>`;
+    const inputs = tr.querySelectorAll('input');
+    inputs[0].onchange = e => { wp.x = clamp(parseFloat(e.target.value || '0'), 0, workspace); };
+    inputs[1].onchange = e => { wp.y = clamp(parseFloat(e.target.value || '0'), 0, workspace); };
+    inputs[2].onchange = e => { wp.velocity = Math.max(0.01, parseFloat(e.target.value || '0.1')); };
+    inputs[3].onchange = e => { wp.dwell = Math.max(0, parseFloat(e.target.value || '0')); };
+    tbody.appendChild(tr);
+  });
+  document.getElementById('wpCount').textContent =
+    `${waypoints.length} point${waypoints.length === 1 ? '' : 's'}`;
+}
+
+function deleteWp(i) {
+  waypoints.splice(i, 1);
+  if (selectedWpIdx === i) selectedWpIdx = -1;
+  else if (selectedWpIdx > i) selectedWpIdx -= 1;
+  renderTable();
+  sendWaypoints();
+}
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const my = (e.clientY - rect.top) * (canvas.height / rect.height);
+  dragIdx = -1;
+
+  if (mapTool === 'mission') {
+    const hit = hitTestWaypoint(mx, my, 12);
+    if (hit >= 0) {
+      selectedWpIdx = hit;
+      dragIdx = hit;
+      return;
+    }
+    selectedWpIdx = -1;
+    const mxy = toMeters(mx, my);
+    const v = parseFloat(document.getElementById('defaultVel').value || '0.15');
+    const d = parseFloat(document.getElementById('defaultDwell').value || '0.0');
+    waypoints.push({ x: mxy.x, y: mxy.y, velocity: v, dwell: d });
+    renderTable();
+    sendWaypoints();
+    return;
+  }
+
+  if (mapTool === 'goto') {
+    const mxy = toMeters(mx, my);
+    setGotoTarget(mxy.x, mxy.y);
+  }
+});
+
+canvas.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const my = (e.clientY - rect.top) * (canvas.height / rect.height);
+  if (mapTool === 'goto' && hitTestGotoTarget(mx, my, 16)) {
+    clearGotoTarget();
+    showErr('Go-to target removed');
+    return;
+  }
+  if (mapTool === 'mission') {
+    const hit = hitTestWaypoint(mx, my, 14);
+    if (hit >= 0) {
+      deleteWp(hit);
+      showErr('Waypoint removed');
+    }
+  }
+});
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const my = (e.clientY - rect.top) * (canvas.height / rect.height);
+  hoverIdx = -1;
+  for (let i = 0; i < waypoints.length; i++) {
+    const p = toPix(waypoints[i].x, waypoints[i].y);
+    if (Math.hypot(p.px - mx, p.py - my) < 12) { hoverIdx = i; break; }
+  }
+  if (dragIdx >= 0 && mapTool === 'mission') {
+    const mxy = toMeters(mx, my);
+    waypoints[dragIdx].x = mxy.x;
+    waypoints[dragIdx].y = mxy.y;
+    renderTable();
+  }
+  const m = toMeters(mx, my);
+  if (m.x >= 0 && m.x <= workspace && m.y >= 0 && m.y <= workspace) {
+    document.getElementById('toolbarInfo').textContent =
+      `cursor  x=${m.x.toFixed(3)} m  y=${m.y.toFixed(3)} m`;
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  if (dragIdx >= 0) sendWaypoints();
+  dragIdx = -1;
+});
+
+function resizeCanvas() {
+  workspace = parseFloat(document.getElementById('ws').value || '1.0');
+}
+
+async function apiGet(path) {
+  const r = await fetch(path);
+  if (!r.ok) {
+    throw new Error(`HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+function setupCameraHandlers() {
+  const cam = document.getElementById('camImg');
+  const ph = document.getElementById('cameraPlaceholder');
+  if (!cam || cam.dataset.handlersBound) return;
+  cam.dataset.handlersBound = '1';
+  cam.onload = () => {
+    cam.style.display = 'block';
+    ph.style.display = 'none';
+    lastCameraDisplayTime = performance.now();
+  };
+}
+
+function startCameraStream() {
+  const cam = document.getElementById('camImg');
+  const ph = document.getElementById('cameraPlaceholder');
+  if (!cam) return;
+  setupCameraHandlers();
+  cam.onerror = () => {
+    cameraUseMjpeg = false;
+    cam.dataset.streaming = '0';
+    cam.style.display = 'none';
+    ph.style.display = 'flex';
+    ph.textContent = 'Camera stream failed — using snapshot mode';
+  };
+  cam.src = '/camera/stream';
+  cam.dataset.streaming = '1';
+  cameraUseMjpeg = true;
+}
+
+async function refreshCamera() {
+  const cam = document.getElementById('camImg');
+  if (cameraUseMjpeg && cam && cam.dataset.streaming === '1') {
+    return;
+  }
+  if (cameraBusy) return;
+  const inGrace = (performance.now() - pageLoadTime) < STARTUP_GRACE_MS;
+  if (!connected && !inGrace && pollFailStreak >= POLL_FAIL_DISCONNECT) return;
+  const now = performance.now();
+  const frameChanged = serverCameraFrameId !== lastCameraFrameId;
+  const stale = (now - lastCameraDisplayTime) > CAMERA_FORCE_REFRESH_MS;
+  if (!frameChanged && !stale && lastCameraDisplayTime > 0) {
+    return;
+  }
+  cameraBusy = true;
+  try {
+    const r = await fetch('/camera/jpeg');
+    if (!r.ok || r.status === 204) return;
+    const hdrFid = parseInt(r.headers.get('X-Frame-Id') || '0', 10);
+    const blob = await r.blob();
+    if (!blob.size) return;
+    const url = URL.createObjectURL(blob);
+    if (lastCameraBlobUrl) URL.revokeObjectURL(lastCameraBlobUrl);
+    lastCameraBlobUrl = url;
+    cam.src = url;
+    if (hdrFid > 0) {
+      lastCameraFrameId = hdrFid;
+    } else if (serverCameraFrameId > 0) {
+      lastCameraFrameId = serverCameraFrameId;
+    }
+    lastCameraDisplayTime = now;
+  } catch (_) {
+    /* retry next tick */
+  } finally {
+    cameraBusy = false;
+  }
+}
+
+function cameraLoop() {
+  refreshCamera();
+  setTimeout(cameraLoop, 150);
+}
+
+async function apiPost(path, data) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data || {}),
+  });
+  if (!r.ok) {
+    throw new Error(`HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+function setStatus(kind, label) {
+  document.getElementById('statusDot').className = `dot ${kind}`;
+  document.getElementById('statusLabel').textContent = label;
+  document.getElementById('statusLabel').className = kind;
+}
+
+async function poll() {
+  try {
+    const s = await apiGet('/state');
+    lastGoodState = s;
+    pollFailStreak = 0;
+    connected = true;
+    previewMode = false;
+    applyStateFromPoll(s);
+    updateCsvProfiles(s.csv_profiles);
+    updateCsvLogStatus(s.csv_log);
+    if (wasHomingActive && !gantryHomingActive && gantryHomed && !stickyGotoError) {
+      const el = document.getElementById('errLine');
+      if (!gantryEstop && el && !el.textContent.startsWith('E-stop')) {
+        el.textContent = 'Homed — set a map target and use Go to point, or run a mission';
+      }
+    }
+    wasHomingActive = gantryHomingActive;
+    if (mission_running) setStatus('running', 'RUNNING');
+    else if (gantryHomingActive) {
+      const label = gantryHomingStatus ? `HOMING (${gantryHomingStatus})` : 'HOMING';
+      setStatus('running', label);
+    } else setStatus('connected', (gantryMode || 'READY').toUpperCase());
+    updateHomedPoseUI();
+    const execBtn = document.getElementById('btnExecuteMission');
+    const goBtn = document.getElementById('btnGoTo');
+    if (execBtn) {
+      execBtn.disabled = gantryHomingActive || mission_running || gantryEstop
+        || !gantryHomed || !connected;
+      execBtn.title = gantryHomingActive ? 'Homing…'
+        : !gantryHomed ? 'Run Home first' : '';
+    }
+    const homeBtn = document.getElementById('btnHome');
+    if (goBtn) {
+      goBtn.disabled = gantryHomingActive || gantryEstop || !gantryHomed || !connected;
+    }
+    if (homeBtn && !gantryHomingActive && !gantryEstop) {
+      homeBtn.disabled = false;
+    }
+    updateHomeButton();
+    updateStatusChips();
+    if (s.mode) {
+      const backendMode = String(s.mode).toUpperCase();
+      if (pendingModeTarget) {
+        const pendingExpired = (performance.now() - pendingModeSince) > 3000;
+        if (backendMode === pendingModeTarget || pendingExpired) {
+          pendingModeTarget = null;
+        }
+      }
+      const sel = document.getElementById('modeSelect');
+      if (sel && sel.value !== backendMode && !(csvStaged && sel.value === 'CSV')) {
+        sel.value = backendMode;
+        updateAdvancedControls();
+      }
+      updateStatusChips();
+    }
+    document.body.classList.toggle('estop-active', gantryEstop);
+    updateHomeButton();
+    const errEl = document.getElementById('errLine');
+    if (gantryEstop) {
+      errEl.textContent = 'E-stop active — Clear E-stop, then Home and Enable';
+    } else if (!gantryHomed && gantryLive && !gantryHomingActive) {
+      errEl.textContent = 'Not homed — click Home (back → left), then Go to or mission';
+    } else if (!gantryLive && !gantryEverReceived) {
+      errEl.textContent =
+        'No /gantry/state yet — start gantry_controller or mission_planner.launch.py';
+    } else if (!gantryLive && gantryStaleS != null) {
+      errEl.textContent =
+        `Gantry state stale (${gantryStaleS}s) — position may use payload tracker`;
+    } else {
+      if (!stickyGotoError &&
+          (errEl.textContent.startsWith('E-stop active') ||
+          errEl.textContent.startsWith('Dashboard connected') ||
+          errEl.textContent.startsWith('Preview') ||
+          errEl.textContent.startsWith('Connecting') ||
+          errEl.textContent.startsWith('Cannot reach') ||
+          errEl.textContent.startsWith('Gantry state stale') ||
+          errEl.textContent.startsWith('Dashboard busy'))) {
+        errEl.textContent = '';
+      }
+    }
+    if (s.pose_e) {
+      applyEncoderSample(s.pose_e.pitch_deg, s.pose_e.roll_deg, performance.now() / 1000,
+        (s.pose_e_rel_live && s.pose_e_rel) ? s.pose_e_rel : null);
+    }
+    if (s.payload) {
+      applyVisionSample(s.payload);
+    }
+    if (s.goto_status) {
+      applyGotoStatus(s.goto_status);
+    }
+  } catch (e) {
+    pollFailStreak += 1;
+    const errEl = document.getElementById('errLine');
+    const inGrace = (performance.now() - pageLoadTime) < STARTUP_GRACE_MS;
+    if (lastGoodState && pollFailStreak < POLL_DISCONNECT_AFTER) {
+      connected = true;
+      applyStateFromPoll(lastGoodState);
+      document.getElementById('poseLine').textContent = 'poll retry…';
+      if (!stickyGotoError) {
+        errEl.textContent = 'Dashboard busy — retrying state poll…';
+      }
+      updateHomedPoseUI();
+      updateStatusChips();
+    } else if (inGrace) {
+      setStatus('preview', 'CONNECTING');
+      errEl.textContent = 'Connecting to dashboard…';
+    } else if (pollFailStreak >= POLL_DISCONNECT_AFTER) {
+      connected = false;
+      previewMode = false;
+      gantryLive = false;
+      setStatus('error', 'DISCONNECTED');
+      document.getElementById('poseLine').textContent = 'offline';
+      errEl.textContent =
+        'Cannot reach dashboard — open http://<jetson>:8081/ (not file://)';
+      updateHomedPoseUI();
+      updateStatusChips();
+    } else {
+      setStatus('preview', 'CONNECTING');
+      errEl.textContent = 'Connecting to dashboard…';
+    }
+  }
+  setTimeout(poll, 150);
+}
+
+async function runHoming() {
+  if (gantryEstop) {
+    showErr('Clear E-stop first, then Home');
+    return;
+  }
+  const btn = document.getElementById('btnHome');
+  if (btn) btn.disabled = true;
+  showErr('Homing… seek back then left');
+  try {
+    const res = await apiPost('/action/home', {});
+    if (res.status === 'error') {
+      showErr(res.message || 'Home failed');
+      if (btn) btn.disabled = false;
+      return;
+    }
+    showErr(res.message || 'Homing started — wait for homed chip');
+  } catch (e) {
+    showErr('Dashboard not connected');
+    if (btn) btn.disabled = false;
+  }
+}
+
+function updateHomeButton() {
+  const btn = document.getElementById('btnHome');
+  if (!btn) return;
+  btn.disabled = gantryHomingActive || gantryEstop;
+  btn.title = gantryEstop
+    ? 'Clear E-stop first'
+    : gantryHomingActive
+      ? `Homing: ${gantryHomingStatus || 'in progress'}`
+      : 'Sensor homing (back then left)';
+}
+
+async function apiAction(name) {
+  let body = {};
+  if (name === 'move_to') {
+    body = {
+      x: parseFloat(document.getElementById('tgtX').value || '0'),
+      y: parseFloat(document.getElementById('tgtY').value || '0'),
+    };
+  }
+  try {
+    const res = await apiPost('/action/' + name, body);
+    if (res.status === 'error') {
+      document.getElementById('errLine').textContent = res.message || `${name} failed`;
+      return;
+    }
+    if (name === 'enable' || name === 'clear_estop' || name === 'disable') {
+      document.getElementById('errLine').textContent = '';
+    }
+    if (name === 'estop') {
+      document.body.classList.add('estop-active');
+    }
+    if (name === 'home') {
+      document.getElementById('errLine').textContent =
+        res.message || 'Sensor homing started — watch status until homed';
+    }
+  } catch (e) {
+    console.log('preview:', name);
+  }
+}
+
+async function sendWaypoints() {
+  await apiPost('/set_waypoints', { waypoints });
+}
+async function executeMission() {
+  if (!waypoints.length) {
+    showErr('Add waypoints on the map first');
+    return;
+  }
+  if (!connected) {
+    showErr('Not connected to gantry');
+    return;
+  }
+  if (gantryEstop) {
+    showErr('Clear E-stop first');
+    return;
+  }
+  await sendWaypoints();
+  showErr(`Running mission (${waypoints.length} points)…`);
+  try {
+    const res = await apiPost('/execute', {});
+    if (res.status === 'error') {
+      showErr(res.message || 'Mission failed to start');
+    }
+  } catch (e) {
+    showErr('Dashboard not connected');
+  }
+}
+async function stopMission() {
+  await apiPost('/stop', {});
+}
+async function clearWaypoints() {
+  waypoints = [];
+  selectedWpIdx = -1;
+  renderTable();
+  await apiPost('/clear', {});
+}
+
+window.addEventListener('keydown', e => {
+  if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+  if (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) {
+    return;
+  }
+  e.preventDefault();
+  deleteMapSelection();
+});
+
+renderTable();
+setTask('goto');
+onTargetTyped();
+startCameraStream();
+setStatus('preview', 'CONNECTING');
+draw();
+poll();
+cameraLoop();
+applyEncoderSample(0, 0, performance.now() / 1000);
+updateStatusChips();
+updateAdvancedControls();
+setupSplitters();
+requestAnimationFrame(() => {
+  fitChartCanvas(); fitVisionChartCanvas(); drawChart(); drawVisionChart();
+});
+</script>
+</body>
+</html>

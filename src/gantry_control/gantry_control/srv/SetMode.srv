@@ -1,0 +1,17 @@
+# Set gantry operating mode
+# Modes: IDLE, HOME, JOG, CSV, TRAJ, MISSION, ZV_JOG
+string mode
+
+# For CSV mode: path to velocity profile CSV (time_s, vx_mm_s, vy_mm_s)
+# TRAJ mode ignores csv_path — use traj_player.py → /traj_cmd
+string csv_path
+
+# For MISSION mode: target position (meters)
+float64 target_x
+float64 target_y
+
+# For JOG mode: jog speed preset (0=slow 10mm/s, 1=medium 50mm/s, 2=fast 200mm/s)
+int32 jog_speed_preset
+---
+bool success
+string message
