@@ -80,6 +80,17 @@ class Estimate:
     A2: float
 
 
+@dataclass
+class IdCandidate:
+    t: float
+    cond_b: float
+    omega_n: float = float('nan')
+    zeta: float = float('nan')
+    T: float = float('nan')
+    valid: bool = False
+    reject_reason: str = ''
+
+
 class AdaptiveIdentifier:
     """
     Online implementation of Eq. (21a)-(21b).
@@ -100,6 +111,8 @@ class AdaptiveIdentifier:
         omega_max: float,
         zeta_min: float,
         zeta_max: float,
+        lowpass_hz: float = 0.0,
+        local_window_s: float = 0.0,
     ):
         self.K = float(K_mm_s)
         self.A0 = float(A0)
@@ -108,6 +121,8 @@ class AdaptiveIdentifier:
         self.omega_max = float(omega_max)
         self.zeta_min = float(zeta_min)
         self.zeta_max = float(zeta_max)
+        self.lowpass_hz = max(0.0, float(lowpass_hz))
+        self.local_window_s = max(0.0, float(local_window_s))
         self.reset()
 
     def reset(self):
@@ -124,6 +139,9 @@ class AdaptiveIdentifier:
         self.Q2 = 0.0
         self.Q3 = 0.0
         self.latest_valid: Estimate | None = None
+        self.latest_candidate: IdCandidate | None = None
+        self.x_filtered: float | None = None
+        self.samples: list[tuple[float, float, float]] = []
 
     def start(
         self,
@@ -137,11 +155,13 @@ class AdaptiveIdentifier:
         self.x_zero = float(x_now_mm) if zero_at_start else 0.0
         self.q_zero = float(q_now_mm) if zero_at_start else 0.0
         x_rel_mm = float(x_now_mm) - self.x_zero
+        self.x_filtered = x_rel_mm
         q_rel_mm = float(q_now_mm) - self.q_zero
         self.t0 = float(t_motion)
         self.prev_t = float(t_motion)
         self.prev_x = x_rel_mm
         self.prev_q = q_rel_mm
+        self.samples = [(0.0, x_rel_mm, q_rel_mm)]
 
     def update(
         self,
@@ -159,7 +179,7 @@ class AdaptiveIdentifier:
 
         t = t_motion - self.t0
         dt = t_motion - self.prev_t
-        x_rel_mm = float(x_now_mm) - self.x_zero
+        x_rel_raw_mm = float(x_now_mm) - self.x_zero
         if q_now_mm is None:
             q_rel_mm = self.K * t
         else:
@@ -167,6 +187,15 @@ class AdaptiveIdentifier:
 
         if dt <= 0.0 or t <= 0.0:
             return None
+        if self.lowpass_hz > 0.0:
+            prev_filtered = self.x_filtered if self.x_filtered is not None else x_rel_raw_mm
+            alpha = 1.0 - math.exp(-2.0 * math.pi * self.lowpass_hz * dt)
+            alpha = max(0.0, min(alpha, 1.0))
+            x_rel_mm = prev_filtered + alpha * (x_rel_raw_mm - prev_filtered)
+            self.x_filtered = x_rel_mm
+        else:
+            x_rel_mm = x_rel_raw_mm
+            self.x_filtered = x_rel_mm
 
         I1_old = self.I1
         I2_old = self.I2
@@ -186,6 +215,11 @@ class AdaptiveIdentifier:
         self.prev_t = t_motion
         self.prev_x = x_rel_mm
         self.prev_q = q_rel_mm
+        self.samples.append((t, x_rel_mm, q_rel_mm))
+        if self.local_window_s > 0.0:
+            keep_after = max(0.0, t - self.local_window_s - 0.05)
+            self.samples = [sample for sample in self.samples if sample[0] >= keep_after]
+            return self._windowed_estimate(t)
 
         I1 = self.I1
         I2 = self.I2
@@ -205,45 +239,249 @@ class AdaptiveIdentifier:
         try:
             cond_b = float(np.linalg.cond(B))
         except np.linalg.LinAlgError:
+            self.latest_candidate = IdCandidate(t=t, cond_b=float('inf'), reject_reason='cond_failed')
             return None
 
         if not math.isfinite(cond_b) or cond_b > self.cond_threshold:
+            self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='bad_cond')
             return None
 
         try:
             theta = np.linalg.solve(B, rhs)
         except np.linalg.LinAlgError:
+            self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='solve_failed')
             return None
 
         two_zeta_omega = float(theta[0])
         omega_sq = float(theta[1])
 
         if not math.isfinite(omega_sq) or omega_sq <= 0.0:
+            self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='bad_omega_sq')
             return None
 
         omega_n = math.sqrt(omega_sq)
         zeta = two_zeta_omega / (2.0 * omega_n)
 
         if not math.isfinite(omega_n) or not math.isfinite(zeta):
+            self.latest_candidate = IdCandidate(
+                t=t,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='bad_omega_zeta',
+            )
             return None
 
         if not (self.omega_min <= omega_n <= self.omega_max):
+            self.latest_candidate = IdCandidate(
+                t=t,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='omega_gate',
+            )
             return None
 
         if not (self.zeta_min <= zeta <= self.zeta_max):
+            self.latest_candidate = IdCandidate(
+                t=t,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='zeta_gate',
+            )
             return None
 
         shaper = self.compute_shaper(zeta, omega_n)
         if shaper is None:
+            self.latest_candidate = IdCandidate(
+                t=t,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='shaper_failed',
+            )
             return None
 
         T, A0, A1, A2 = shaper
+        self.latest_candidate = IdCandidate(
+            t=t,
+            cond_b=cond_b,
+            omega_n=omega_n,
+            zeta=zeta,
+            T=T,
+            valid=True,
+        )
         est = Estimate(
             t=t,
             x=x_rel_mm,
             i1=I1,
             i2=I2,
             i3=I3,
+            cond_b=cond_b,
+            omega_n=omega_n,
+            zeta=zeta,
+            T=T,
+            A0=A0,
+            A1=A1,
+            A2=A2,
+        )
+        self.latest_valid = est
+        return est
+
+    def _windowed_estimate(self, t_now: float) -> Estimate | None:
+        """Estimate over a local window while fitting local initial velocity.
+
+        Eq. (21) assumes the payload starts the ID interval with zero velocity.
+        A sliding window generally violates that, so this local form solves for
+        [2*zeta*omega, omega**2, xdot_window_start] with least squares.
+        """
+        window_start = max(0.0, t_now - self.local_window_s)
+        window = [sample for sample in self.samples if sample[0] >= window_start]
+        if len(window) < 8:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=float('inf'), reject_reason='local_short')
+            return None
+
+        t0, x0, q0 = window[0]
+        times = np.asarray([sample[0] - t0 for sample in window], dtype=float)
+        x_vals = np.asarray([sample[1] for sample in window], dtype=float)
+        q_vals = np.asarray([sample[2] for sample in window], dtype=float)
+        if not (np.all(np.isfinite(times)) and np.all(np.isfinite(x_vals)) and np.all(np.isfinite(q_vals))):
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=float('inf'), reject_reason='local_bad_samples')
+            return None
+
+        span = float(times[-1] - times[0])
+        if span < 0.20:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=float('inf'), reject_reason='local_short_span')
+            return None
+
+        x_rel = x_vals - x0
+        q_rel = q_vals - q0
+        swing0 = x0 - q0
+
+        I1 = np.zeros_like(times)
+        Q1 = np.zeros_like(times)
+        I2 = np.zeros_like(times)
+        Q2 = np.zeros_like(times)
+        I3 = np.zeros_like(times)
+        Q3 = np.zeros_like(times)
+        for i in range(1, len(times)):
+            dt = times[i] - times[i - 1]
+            if dt <= 0.0:
+                continue
+            I1[i] = I1[i - 1] + 0.5 * (x_rel[i - 1] + x_rel[i]) * dt
+            Q1[i] = Q1[i - 1] + 0.5 * (q_rel[i - 1] + q_rel[i]) * dt
+            I2[i] = I2[i - 1] + 0.5 * (I1[i - 1] + I1[i]) * dt
+            Q2[i] = Q2[i - 1] + 0.5 * (Q1[i - 1] + Q1[i]) * dt
+            I3[i] = I3[i - 1] + 0.5 * (I2[i - 1] + I2[i]) * dt
+            Q3[i] = Q3[i - 1] + 0.5 * (Q2[i - 1] + Q2[i]) * dt
+
+        rows: list[list[float]] = []
+        rhs: list[float] = []
+        for i in range(1, len(times)):
+            tau = float(times[i])
+            if tau <= 0.0:
+                continue
+            spring_i2 = float(I2[i] - Q2[i] + 0.5 * swing0 * tau * tau)
+            spring_i3 = float(I3[i] - Q3[i] + swing0 * tau * tau * tau / 6.0)
+            rows.append([float(I1[i]), spring_i2, -tau])
+            rhs.append(float(-x_rel[i]))
+            rows.append([float(I2[i]), spring_i3, -0.5 * tau * tau])
+            rhs.append(float(-I1[i]))
+
+        if len(rows) < 6:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=float('inf'), reject_reason='local_short_rows')
+            return None
+
+        A = np.asarray(rows, dtype=float)
+        b = np.asarray(rhs, dtype=float)
+        scales = np.linalg.norm(A, axis=0)
+        if np.any(scales <= 1.0e-12) or not np.all(np.isfinite(scales)):
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=float('inf'), reject_reason='local_bad_scale')
+            return None
+
+        A_scaled = A / scales
+        try:
+            cond_b = float(np.linalg.cond(A_scaled))
+        except np.linalg.LinAlgError:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=float('inf'), reject_reason='local_cond_failed')
+            return None
+        if not math.isfinite(cond_b) or cond_b > self.cond_threshold:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=cond_b, reject_reason='local_bad_cond')
+            return None
+
+        try:
+            theta_scaled, _, rank, _ = np.linalg.lstsq(A_scaled, b, rcond=None)
+        except np.linalg.LinAlgError:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=cond_b, reject_reason='local_solve_failed')
+            return None
+        if rank < 3:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=cond_b, reject_reason='local_rank')
+            return None
+
+        theta = theta_scaled / scales
+        two_zeta_omega = float(theta[0])
+        omega_sq = float(theta[1])
+        if not math.isfinite(omega_sq) or omega_sq <= 0.0:
+            self.latest_candidate = IdCandidate(t=t_now, cond_b=cond_b, reject_reason='local_bad_omega_sq')
+            return None
+
+        omega_n = math.sqrt(omega_sq)
+        zeta = two_zeta_omega / (2.0 * omega_n)
+        if not math.isfinite(omega_n) or not math.isfinite(zeta):
+            self.latest_candidate = IdCandidate(
+                t=t_now,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='local_bad_omega_zeta',
+            )
+            return None
+        if not (self.omega_min <= omega_n <= self.omega_max):
+            self.latest_candidate = IdCandidate(
+                t=t_now,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='local_omega_gate',
+            )
+            return None
+        if not (self.zeta_min <= zeta <= self.zeta_max):
+            self.latest_candidate = IdCandidate(
+                t=t_now,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='local_zeta_gate',
+            )
+            return None
+
+        shaper = self.compute_shaper(zeta, omega_n)
+        if shaper is None:
+            self.latest_candidate = IdCandidate(
+                t=t_now,
+                cond_b=cond_b,
+                omega_n=omega_n,
+                zeta=zeta,
+                reject_reason='local_shaper_failed',
+            )
+            return None
+
+        T, A0, A1, A2 = shaper
+        self.latest_candidate = IdCandidate(
+            t=t_now,
+            cond_b=cond_b,
+            omega_n=omega_n,
+            zeta=zeta,
+            T=T,
+            valid=True,
+        )
+        est = Estimate(
+            t=t_now,
+            x=float(x_rel[-1]),
+            i1=float(I1[-1]),
+            i2=float(I2[-1]),
+            i3=float(I3[-1]),
             cond_b=cond_b,
             omega_n=omega_n,
             zeta=zeta,

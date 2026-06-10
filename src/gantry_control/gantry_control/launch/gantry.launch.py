@@ -51,11 +51,14 @@ def generate_launch_description():
     experiment_yaml = os.path.join(config_dir, 'experiment.yaml')
     encoder_yaml = os.path.join(config_dir, 'encoder.yaml')
     encoder_serial_yaml = os.path.join(config_dir, 'encoder_serial.yaml')
+    fastdds_no_shm_xml = os.path.join(config_dir, 'fastdds_no_shm.xml')
     gantry_yaml = os.path.join(config_dir, 'gantry.yaml')
     mount = _payload_mount_defaults(config_dir)
 
     return LaunchDescription([
         SetEnvironmentVariable('JETSON_MODEL_NAME', 'JETSON_ORIN_NANO'),
+        SetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE', fastdds_no_shm_xml),
+        SetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE', fastdds_no_shm_xml),
 
         DeclareLaunchArgument('joy_dev', default_value='/dev/input/js0'),
         SetEnvironmentVariable(
