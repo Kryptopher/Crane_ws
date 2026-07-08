@@ -423,9 +423,7 @@ class LoggerNode(Node):
             ])
         if self._log_imu:
             header.extend([
-                'imu1_ax', 'imu1_ay', 'imu1_az',
                 'imu1_gx', 'imu1_gy', 'imu1_gz',
-                'imu2_ax', 'imu2_ay', 'imu2_az',
                 'imu2_gx', 'imu2_gy', 'imu2_gz',
             ])
         self._writer.writerow(header)
@@ -565,9 +563,12 @@ class LoggerNode(Node):
         if self._log_imu:
             if include_imu and self._last_imu is not None:
                 imu = self._last_imu
-                row.extend([f'{imu[i]:.6f}' for i in range(2, 14)])
+                # imu_raw layout: [t, arduino_ms, imu1_a(xyz), imu1_g(xyz),
+                # imu2_a(xyz), imu2_g(xyz), packet_age_ms, packet_seen] —
+                # skip accel (indices 2-4, 8-10), keep gyro only.
+                row.extend([f'{imu[i]:.6f}' for i in (5, 6, 7, 11, 12, 13)])
             else:
-                row.extend([''] * 12)
+                row.extend([''] * 6)
 
         self._writer.writerow(row)
         self._rows += 1
