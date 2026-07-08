@@ -226,12 +226,12 @@ class LoggerNode(Node):
             self._write_pose_row(now)
 
     def _on_imu_raw(self, msg: Float64MultiArray):
-        if len(msg.data) < 16:
+        if len(msg.data) < 9:
             return
         if self._wait_motion and not self._motion_started:
             return
         now = time.monotonic()
-        self._last_imu = list(msg.data[:16])
+        self._last_imu = list(msg.data[:9])
         self._last_imu_rx = now
         self._imu_times.append(now)
         self._maybe_start_logging()
@@ -423,8 +423,8 @@ class LoggerNode(Node):
             ])
         if self._log_imu:
             header.extend([
-                'imu1_gx', 'imu1_gy', 'imu1_gz',
-                'imu2_gx', 'imu2_gy', 'imu2_gz',
+                'imu1_gx_dps', 'imu1_gy_dps', 'imu1_gz_dps',
+                'imu2_gx_dps', 'imu2_gy_dps', 'imu2_gz_dps',
             ])
         self._writer.writerow(header)
         self._logging_ready = True
@@ -563,10 +563,9 @@ class LoggerNode(Node):
         if self._log_imu:
             if include_imu and self._last_imu is not None:
                 imu = self._last_imu
-                # imu_raw layout: [t, arduino_ms, imu1_a(xyz), imu1_g(xyz),
-                # imu2_a(xyz), imu2_g(xyz), packet_age_ms, packet_seen] —
-                # skip accel (indices 2-4, 8-10), keep gyro only.
-                row.extend([f'{imu[i]:.6f}' for i in (5, 6, 7, 11, 12, 13)])
+                # imu_raw layout: [t, arduino_ms, imu1_g(xyz)_dps,
+                # imu2_g(xyz)_dps, packet_age_ms, packet_seen].
+                row.extend([f'{imu[i]:.6f}' for i in range(2, 8)])
             else:
                 row.extend([''] * 6)
 

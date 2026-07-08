@@ -2,8 +2,17 @@
 """
 encoder_serial_node — Arduino Nano quadrature encoder bridge.
 
-Reads lines from USB serial:
+Reads lines from USB serial, either the original encoder-only format:
   millis,pitch_count,roll_count
+
+or the current encoder+gyro(dps)+radio-status format:
+  millis,pitch_count,roll_count,gx1_dps,gy1_dps,gz1_dps,gx2_dps,gy2_dps,gz2_dps,packet_age_ms,packet_seen
+
+or the legacy encoder+IMU(accel+gyro raw counts)[+radio-status] format, kept for
+backward compatibility (accel/gyro here are raw counts, not dps — imu*_dps
+fields are published as NaN for these lines since there's no known conversion
+factor from raw counts to dps):
+  millis,pitch_count,roll_count,ax1,ay1,az1,gx1,gy1,gz1,ax2,ay2,az2,gx2,gy2,gz2[,packet_age_ms,packet_seen]
 
 Publishes the existing dashboard/logger-compatible topics:
   /payload/pose_e
@@ -14,6 +23,8 @@ Publishes the existing dashboard/logger-compatible topics:
 from __future__ import annotations
 
 import math
+import glob
+import os
 import threading
 import time
 from typing import Optional, Tuple
@@ -37,6 +48,18 @@ POSE_E_REL_FIELDS = (
   'x_rel_m', 'y_rel_m', 'z_rel_m',
   'vx_rel_m_s', 'vy_rel_m_s', 'vz_rel_m_s',
 )
+IMU_RAW_FIELDS = (
+  'time',
+  'arduino_ms',
+  'imu1_gx_dps',
+  'imu1_gy_dps',
+  'imu1_gz_dps',
+  'imu2_gx_dps',
+  'imu2_gy_dps',
+  'imu2_gz_dps',
+  'packet_age_ms',
+  'packet_seen',
+)
 DIAG_FIELDS = (
   'time',
   'arduino_ms',
@@ -44,6 +67,14 @@ DIAG_FIELDS = (
   'roll_raw',
   'pitch_count',
   'roll_count',
+  'imu1_gx_dps',
+  'imu1_gy_dps',
+  'imu1_gz_dps',
+  'imu2_gx_dps',
+  'imu2_gy_dps',
+  'imu2_gz_dps',
+  'packet_age_ms',
+  'packet_seen',
   'serial_lines',
   'parse_errors',
   'stale',
@@ -69,7 +100,8 @@ class EncoderSerialNode(Node):
     self.declare_parameter('rel_sign_y', 1.0)
     self.declare_parameter('stale_timeout_s', 0.5)
 
-    self._port = str(self.get_parameter('serial_port').value)
+    self._configured_port = str(self.get_parameter('serial_port').value)
+    self._port = self._resolve_serial_port(self._configured_port)
     self._baud = int(self.get_parameter('baud').value)
     publish_hz = float(self.get_parameter('publish_rate_hz').value)
     self._publish_hz = max(5.0, min(publish_hz, 200.0))
@@ -97,6 +129,9 @@ class EncoderSerialNode(Node):
     self._arduino_ms = 0
     self._pitch_raw = 0
     self._roll_raw = 0
+    self._gyro_dps = [float('nan')] * 6
+    self._packet_age_ms = float('nan')
+    self._packet_seen = float('nan')
     self._pitch_zero: Optional[int] = None
     self._roll_zero: Optional[int] = None
     self._last_rx_mono = 0.0
@@ -111,6 +146,8 @@ class EncoderSerialNode(Node):
       Float64MultiArray, '/payload/pose_e', qos_profile_sensor_data)
     self.pub_rel = self.create_publisher(
       Float64MultiArray, '/payload/pose_e_rel', qos_profile_sensor_data)
+    self.pub_imu = self.create_publisher(
+      Float64MultiArray, '/payload/imu_raw', qos_profile_sensor_data)
     self.pub_diag = self.create_publisher(
       Float64MultiArray, '/payload/encoder/diagnostics', qos_profile_sensor_data)
     self.create_service(
@@ -120,7 +157,7 @@ class EncoderSerialNode(Node):
     if serial is None:
       raise RuntimeError('python3-serial/pyserial is not installed')
 
-    self._ser = serial.Serial(self._port, self._baud, timeout=0.1)
+    self._ser = self._open_serial_with_retry()
     self._reader = threading.Thread(target=self._read_loop, daemon=True)
     self._reader.start()
     self._timer = self.create_timer(1.0 / self._publish_hz, self._publish)
@@ -129,6 +166,75 @@ class EncoderSerialNode(Node):
       f'Arduino encoder serial ready port={self._port} baud={self._baud} '
       f'@ {self._publish_hz:.1f} Hz deg/count={self._deg_per_count:.5f} '
       f'(L={self._rope_length_m:.2f} m)')
+
+  def _open_serial_with_retry(self):
+    deadline = time.monotonic() + 12.0
+    last_exc: Exception | None = None
+    last_port = self._port
+    while time.monotonic() < deadline:
+      port = self._resolve_serial_port(self._configured_port)
+      last_port = port
+      if port != self._configured_port:
+        self.get_logger().warn(
+          f'Configured serial port {self._configured_port} is unavailable; '
+          f'using detected port {port}')
+      try:
+        ser = serial.Serial(port, self._baud, timeout=0.1)
+      except Exception as exc:
+        last_exc = exc
+        self.get_logger().warn(
+          f'Waiting for encoder serial port {self._configured_port} '
+          f'(last tried {port}): {exc}')
+        time.sleep(0.5)
+        continue
+      self._port = port
+      return ser
+
+    if last_exc is not None:
+      raise RuntimeError(
+        f'could not open encoder serial port {self._configured_port} '
+        f'(last tried {last_port}) after 12s: {last_exc}')
+    raise RuntimeError(
+      f'could not find encoder serial port {self._configured_port} after 12s')
+
+  def _resolve_serial_port(self, configured_port: str) -> str:
+    if os.path.exists(configured_port):
+      return configured_port
+
+    patterns = [
+      '/dev/ttyCH341USB*',
+      '/dev/serial/by-id/*',
+      '/dev/serial/by-path/*',
+      '/dev/ttyUSB*',
+      '/dev/ttyACM*',
+    ]
+    candidates = []
+    seen = set()
+    for pattern in patterns:
+      for path in sorted(glob.glob(pattern)):
+        if path in seen:
+          continue
+        seen.add(path)
+        if os.path.exists(path):
+          candidates.append(path)
+
+    if len(candidates) == 1:
+      return candidates[0]
+
+    ch341_candidates = [
+      path for path in candidates
+      if os.path.basename(path).startswith('ttyCH341USB')
+    ]
+    if len(ch341_candidates) == 1:
+      return ch341_candidates[0]
+
+    if candidates:
+      raise RuntimeError(
+        f'Configured serial port {configured_port} is unavailable and multiple '
+        f'candidate serial ports were found: {", ".join(candidates)}. '
+        'Set encoder_serial_node.serial_port explicitly.')
+
+    return configured_port
 
   def _on_set_parameters(self, params):
     for param in params:
@@ -159,12 +265,24 @@ class EncoderSerialNode(Node):
         continue
       try:
         line = raw.decode('ascii', errors='ignore').strip()
+        if not line or line.lower().startswith('time_ms,'):
+          continue
         parts = line.split(',')
-        if len(parts) != 3:
-          raise ValueError('expected 3 comma-separated fields')
-        arduino_ms = int(parts[0])
+        if len(parts) not in (3, 11, 15, 17):
+          raise ValueError('expected 3, 11, 15, or 17 comma-separated fields')
+        arduino_ms = float(parts[0])
         pitch_raw = int(parts[1])
         roll_raw = int(parts[2])
+        if len(parts) == 11:
+          gyro_dps = [float(value) for value in parts[3:9]]
+          packet_age_ms = float(parts[9])
+          packet_seen = float(parts[10])
+        else:
+          # Legacy accel+gyro raw-count format (or encoder-only): no dps
+          # reading available.
+          gyro_dps = [float('nan')] * 6
+          packet_age_ms = float(parts[15]) if len(parts) >= 17 else float('nan')
+          packet_seen = float(parts[16]) if len(parts) >= 17 else float('nan')
       except Exception:
         with self._lock:
           self._parse_errors += 1
@@ -174,6 +292,9 @@ class EncoderSerialNode(Node):
         self._arduino_ms = arduino_ms
         self._pitch_raw = pitch_raw
         self._roll_raw = roll_raw
+        self._gyro_dps = gyro_dps
+        self._packet_age_ms = packet_age_ms
+        self._packet_seen = packet_seen
         if self._zero_on_start and self._pitch_zero is None:
           self._pitch_zero = pitch_raw
           self._roll_zero = roll_raw
@@ -247,12 +368,41 @@ class EncoderSerialNode(Node):
     ]
     return msg
 
+  def _build_imu_msg(
+    self,
+    t: float,
+    arduino_ms: float,
+    gyro_dps: list[float],
+    packet_age_ms: float,
+    packet_seen: float,
+  ) -> Float64MultiArray:
+    msg = Float64MultiArray()
+    dim = MultiArrayDimension()
+    dim.label = ','.join(IMU_RAW_FIELDS)
+    dim.size = len(IMU_RAW_FIELDS)
+    dim.stride = len(IMU_RAW_FIELDS)
+    msg.layout.dim.append(dim)
+    values = list(gyro_dps[:6])
+    if len(values) < 6:
+      values.extend([float('nan')] * (6 - len(values)))
+    msg.data = [
+      float(t),
+      float(arduino_ms),
+      *[float(value) for value in values],
+      float(packet_age_ms),
+      float(packet_seen),
+    ]
+    return msg
+
   def _publish(self):
     now = time.monotonic()
     with self._lock:
       arduino_ms = self._arduino_ms
       pitch_raw = self._pitch_raw
       roll_raw = self._roll_raw
+      gyro_dps = list(self._gyro_dps)
+      packet_age_ms = self._packet_age_ms
+      packet_seen = self._packet_seen
       pitch, roll = self._relative_counts_locked()
       serial_lines = self._serial_lines
       parse_errors = self._parse_errors
@@ -273,6 +423,9 @@ class EncoderSerialNode(Node):
     ]
     self.pub.publish(msg)
     self.pub_rel.publish(self._build_rel_msg(t, pitch_deg, roll_deg))
+    self.pub_imu.publish(
+      self._build_imu_msg(
+        t, arduino_ms, gyro_dps, packet_age_ms, packet_seen))
 
     diag = Float64MultiArray()
     dim = MultiArrayDimension()
@@ -287,6 +440,9 @@ class EncoderSerialNode(Node):
       float(roll_raw),
       float(pitch),
       float(roll),
+      *[float(value) for value in gyro_dps],
+      float(packet_age_ms),
+      float(packet_seen),
       float(serial_lines),
       float(parse_errors),
       1.0 if stale else 0.0,
