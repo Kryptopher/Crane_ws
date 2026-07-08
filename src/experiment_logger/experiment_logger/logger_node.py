@@ -86,19 +86,23 @@ class LoggerNode(Node):
         self._log_pose = False
         self._log_pose_e = False
         self._log_pose_e_rel = False
+        self._log_imu = False
         self._synced_stream_mode = False
 
         self._last_pose: Optional[List[float]] = None
         self._last_pose_e: Optional[List[float]] = None
         self._last_pose_e_rel: Optional[List[float]] = None
+        self._last_imu: Optional[List[float]] = None
         self._last_gantry_cart: Optional[List[float]] = None
         self._last_pose_rx = 0.0
         self._last_pose_e_rx = 0.0
         self._last_pose_e_rel_rx = 0.0
+        self._last_imu_rx = 0.0
         self._last_gantry_rx = 0.0
         self._pose_times: Deque[float] = deque(maxlen=200)
         self._pose_e_times: Deque[float] = deque(maxlen=200)
         self._pose_e_rel_times: Deque[float] = deque(maxlen=200)
+        self._imu_times: Deque[float] = deque(maxlen=200)
         self._last_gantry_mode = ''
 
         self._fp = None
@@ -125,6 +129,9 @@ class LoggerNode(Node):
         self.create_subscription(
             Float64MultiArray, '/payload/pose_e_rel',
             self._on_pose_e_rel, qos_profile_sensor_data)
+        self.create_subscription(
+            Float64MultiArray, '/payload/imu_raw',
+            self._on_imu_raw, qos_profile_sensor_data)
         if self._log_traj_cmd:
             self.create_subscription(
                 TrajCmd, '/traj_cmd', self._on_traj_cmd, _TRAJ_QOS)
@@ -218,6 +225,19 @@ class LoggerNode(Node):
         if self._logging_ready and self._log_pose_e_rel and not self._synced_stream_mode:
             self._write_pose_row(now)
 
+    def _on_imu_raw(self, msg: Float64MultiArray):
+        if len(msg.data) < 16:
+            return
+        if self._wait_motion and not self._motion_started:
+            return
+        now = time.monotonic()
+        self._last_imu = list(msg.data[:16])
+        self._last_imu_rx = now
+        self._imu_times.append(now)
+        self._maybe_start_logging()
+        if self._logging_ready and self._log_imu and not self._synced_stream_mode:
+            self._write_pose_row(now)
+
     def _on_traj_cmd(self, msg: TrajCmd):
         self._ensure_traj_log()
         t_sec = self._stamp_to_session_sec(msg.header.stamp)
@@ -270,6 +290,8 @@ class LoggerNode(Node):
             n += 1
         if self._log_pose_e_rel and self._pose_e_rel_active(now):
             n += 1
+        if self._log_imu and self._imu_active(now):
+            n += 1
         return n
 
     def _pose_active(self, now: float) -> bool:
@@ -288,6 +310,12 @@ class LoggerNode(Node):
         return (
             self._last_pose_e_rel is not None
             and (now - self._last_pose_e_rel_rx) <= self._stale_timeout
+        )
+
+    def _imu_active(self, now: float) -> bool:
+        return (
+            self._last_imu is not None
+            and (now - self._last_imu_rx) <= self._stale_timeout
         )
 
     def _estimate_hz(self, times: Deque[float], now: float) -> float:
@@ -314,9 +342,11 @@ class LoggerNode(Node):
         self._last_pose = None
         self._last_pose_e = None
         self._last_pose_e_rel = None
+        self._last_imu = None
         self._pose_times.clear()
         self._pose_e_times.clear()
         self._pose_e_rel_times.clear()
+        self._imu_times.clear()
         self._started = time.monotonic()
         self.get_logger().info(
             f'{trigger} — experiment pose log t=0 synced to motors')
@@ -361,6 +391,7 @@ class LoggerNode(Node):
         self._log_pose = self._pose_active(now)
         self._log_pose_e = self._pose_e_active(now)
         self._log_pose_e_rel = self._pose_e_rel_active(now)
+        self._log_imu = self._imu_active(now)
 
         if not self._log_pose and not self._log_pose_e and not self._log_pose_e_rel:
             self.get_logger().warn(
@@ -390,10 +421,18 @@ class LoggerNode(Node):
                 'x_rel_m', 'y_rel_m', 'z_rel_m',
                 'vx_rel_m_s', 'vy_rel_m_s', 'vz_rel_m_s',
             ])
+        if self._log_imu:
+            header.extend([
+                'imu1_ax', 'imu1_ay', 'imu1_az',
+                'imu1_gx', 'imu1_gy', 'imu1_gz',
+                'imu2_ax', 'imu2_ay', 'imu2_az',
+                'imu2_gx', 'imu2_gy', 'imu2_gz',
+            ])
         self._writer.writerow(header)
         self._logging_ready = True
 
-        n_streams = int(self._log_pose) + int(self._log_pose_e) + int(self._log_pose_e_rel)
+        n_streams = (int(self._log_pose) + int(self._log_pose_e)
+                     + int(self._log_pose_e_rel) + int(self._log_imu))
         self._synced_stream_mode = n_streams >= 2
 
         streams = []
@@ -403,6 +442,8 @@ class LoggerNode(Node):
             streams.append('encoder (/payload/pose_e)')
         if self._log_pose_e_rel:
             streams.append('encoder relative (/payload/pose_e_rel)')
+        if self._log_imu:
+            streams.append('IMU (/payload/imu_raw)')
 
         if self._synced_stream_mode:
             hz = self._matched_log_hz(now)
@@ -426,6 +467,8 @@ class LoggerNode(Node):
             rates.append(self._clamp_hz(self._estimate_hz(self._pose_e_times, now)))
         if self._log_pose_e_rel:
             rates.append(self._clamp_hz(self._estimate_hz(self._pose_e_rel_times, now)))
+        if self._log_imu:
+            rates.append(self._clamp_hz(self._estimate_hz(self._imu_times, now)))
         if not rates:
             return self._min_log_hz
         return min(rates)
@@ -464,6 +507,7 @@ class LoggerNode(Node):
         include_pose = self._log_pose and self._pose_active(now)
         include_pose_e = self._log_pose_e and self._pose_e_active(now)
         include_pose_e_rel = self._log_pose_e_rel and self._pose_e_rel_active(now)
+        include_imu = self._log_imu and self._imu_active(now)
         if not include_pose and not include_pose_e and not include_pose_e_rel:
             return
 
@@ -517,6 +561,13 @@ class LoggerNode(Node):
                 return
             row = [f'{e[0]:.6f}']
             row.extend([f'{e[1]:.6f}', f'{e[2]:.6f}', f'{e[3]:.1f}', f'{e[4]:.1f}'])
+
+        if self._log_imu:
+            if include_imu and self._last_imu is not None:
+                imu = self._last_imu
+                row.extend([f'{imu[i]:.6f}' for i in range(2, 14)])
+            else:
+                row.extend([''] * 12)
 
         self._writer.writerow(row)
         self._rows += 1
