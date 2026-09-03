@@ -113,6 +113,7 @@ class AdaptiveIdentifier:
         zeta_max: float,
         lowpass_hz: float = 0.0,
         local_window_s: float = 0.0,
+        assume_zero_zeta: bool = False,
     ):
         self.K = float(K_mm_s)
         self.A0 = float(A0)
@@ -123,6 +124,7 @@ class AdaptiveIdentifier:
         self.zeta_max = float(zeta_max)
         self.lowpass_hz = max(0.0, float(lowpass_hz))
         self.local_window_s = max(0.0, float(local_window_s))
+        self.assume_zero_zeta = bool(assume_zero_zeta)
         self.reset()
 
     def reset(self):
@@ -236,31 +238,44 @@ class AdaptiveIdentifier:
         )
         rhs = np.array([-x_rel_mm, -I1], dtype=float)
 
-        try:
-            cond_b = float(np.linalg.cond(B))
-        except np.linalg.LinAlgError:
-            self.latest_candidate = IdCandidate(t=t, cond_b=float('inf'), reject_reason='cond_failed')
-            return None
+        if self.assume_zero_zeta:
+            denom = I2 - Q2
+            if abs(denom) <= 1.0e-12 or not math.isfinite(denom):
+                self.latest_candidate = IdCandidate(
+                    t=t,
+                    cond_b=float('inf'),
+                    reject_reason='zero_zeta_bad_denom',
+                )
+                return None
+            cond_b = 1.0
+            two_zeta_omega = 0.0
+            omega_sq = float(-x_rel_mm / denom)
+        else:
+            try:
+                cond_b = float(np.linalg.cond(B))
+            except np.linalg.LinAlgError:
+                self.latest_candidate = IdCandidate(t=t, cond_b=float('inf'), reject_reason='cond_failed')
+                return None
 
-        if not math.isfinite(cond_b) or cond_b > self.cond_threshold:
-            self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='bad_cond')
-            return None
+            if not math.isfinite(cond_b) or cond_b > self.cond_threshold:
+                self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='bad_cond')
+                return None
 
-        try:
-            theta = np.linalg.solve(B, rhs)
-        except np.linalg.LinAlgError:
-            self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='solve_failed')
-            return None
+            try:
+                theta = np.linalg.solve(B, rhs)
+            except np.linalg.LinAlgError:
+                self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='solve_failed')
+                return None
 
-        two_zeta_omega = float(theta[0])
-        omega_sq = float(theta[1])
+            two_zeta_omega = float(theta[0])
+            omega_sq = float(theta[1])
 
         if not math.isfinite(omega_sq) or omega_sq <= 0.0:
             self.latest_candidate = IdCandidate(t=t, cond_b=cond_b, reject_reason='bad_omega_sq')
             return None
 
         omega_n = math.sqrt(omega_sq)
-        zeta = two_zeta_omega / (2.0 * omega_n)
+        zeta = 0.0 if self.assume_zero_zeta else two_zeta_omega / (2.0 * omega_n)
 
         if not math.isfinite(omega_n) or not math.isfinite(zeta):
             self.latest_candidate = IdCandidate(
@@ -384,12 +399,19 @@ class AdaptiveIdentifier:
                 continue
             spring_i2 = float(I2[i] - Q2[i] + 0.5 * swing0 * tau * tau)
             spring_i3 = float(I3[i] - Q3[i] + swing0 * tau * tau * tau / 6.0)
-            rows.append([float(I1[i]), spring_i2, -tau])
+            if self.assume_zero_zeta:
+                rows.append([spring_i2, -tau])
+            else:
+                rows.append([float(I1[i]), spring_i2, -tau])
             rhs.append(float(-x_rel[i]))
-            rows.append([float(I2[i]), spring_i3, -0.5 * tau * tau])
+            if self.assume_zero_zeta:
+                rows.append([spring_i3, -0.5 * tau * tau])
+            else:
+                rows.append([float(I2[i]), spring_i3, -0.5 * tau * tau])
             rhs.append(float(-I1[i]))
 
-        if len(rows) < 6:
+        min_rows = 4 if self.assume_zero_zeta else 6
+        if len(rows) < min_rows:
             self.latest_candidate = IdCandidate(t=t_now, cond_b=float('inf'), reject_reason='local_short_rows')
             return None
 
@@ -415,19 +437,24 @@ class AdaptiveIdentifier:
         except np.linalg.LinAlgError:
             self.latest_candidate = IdCandidate(t=t_now, cond_b=cond_b, reject_reason='local_solve_failed')
             return None
-        if rank < 3:
+        min_rank = 2 if self.assume_zero_zeta else 3
+        if rank < min_rank:
             self.latest_candidate = IdCandidate(t=t_now, cond_b=cond_b, reject_reason='local_rank')
             return None
 
         theta = theta_scaled / scales
-        two_zeta_omega = float(theta[0])
-        omega_sq = float(theta[1])
+        if self.assume_zero_zeta:
+            two_zeta_omega = 0.0
+            omega_sq = float(theta[0])
+        else:
+            two_zeta_omega = float(theta[0])
+            omega_sq = float(theta[1])
         if not math.isfinite(omega_sq) or omega_sq <= 0.0:
             self.latest_candidate = IdCandidate(t=t_now, cond_b=cond_b, reject_reason='local_bad_omega_sq')
             return None
 
         omega_n = math.sqrt(omega_sq)
-        zeta = two_zeta_omega / (2.0 * omega_n)
+        zeta = 0.0 if self.assume_zero_zeta else two_zeta_omega / (2.0 * omega_n)
         if not math.isfinite(omega_n) or not math.isfinite(zeta):
             self.latest_candidate = IdCandidate(
                 t=t_now,

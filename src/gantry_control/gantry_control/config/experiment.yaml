@@ -3,7 +3,7 @@
 # Shared vision + gantry cart pose publish rate (see gantry.yaml stack_pose_publish_hz)
 /**:
   ros__parameters:
-    stack_pose_publish_hz: 50.0
+    stack_pose_publish_hz: 100.0
 
 # encoder_node parameters moved to encoder.yaml (loaded by gantry.launch.py)
 

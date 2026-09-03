@@ -5,6 +5,7 @@ Gantry CLI — quick command-line interface for common operations.
 Usage:
     python3 gantry_cli.py enable
     python3 gantry_cli.py home
+    python3 gantry_cli.py force-home         # set current position as home (no seek)
     python3 gantry_cli.py jog [0|1|2]       # speed preset
     python3 gantry_cli.py csv <path>
     python3 gantry_cli.py traj          # arm TRAJ (run traj_player.py with velocity CSV)
@@ -30,7 +31,7 @@ class GantryCLI(Node):
 
     def call_trigger(self, service_name):
         cli = self.create_client(Trigger, service_name)
-        if not cli.wait_for_service(timeout_sec=2.0):
+        if not cli.wait_for_service(timeout_sec=8.0):
             print(f"Service {service_name} not available.")
             return
         req = Trigger.Request()
@@ -44,7 +45,7 @@ class GantryCLI(Node):
 
     def call_set_mode(self, mode, csv_path='', jog_preset=0, tx=0.0, ty=0.0):
         cli = self.create_client(SetMode, '/gantry/set_mode')
-        if not cli.wait_for_service(timeout_sec=2.0):
+        if not cli.wait_for_service(timeout_sec=8.0):
             print("Service /gantry/set_mode not available.")
             return
         req = SetMode.Request()
@@ -63,7 +64,7 @@ class GantryCLI(Node):
 
     def call_move_to(self, x, y):
         cli = self.create_client(MoveTo, '/gantry/move_to')
-        if not cli.wait_for_service(timeout_sec=2.0):
+        if not cli.wait_for_service(timeout_sec=8.0):
             print("Service /gantry/move_to not available.")
             return
         req = MoveTo.Request()
@@ -126,6 +127,8 @@ def main():
         node.call_set_mode('IDLE')
     elif cmd == 'home':
         node.call_set_mode('HOME')
+    elif cmd in ('force-home', 'force_home', 'sethome', 'set-home'):
+        node.call_trigger('/gantry/force_home')
     elif cmd == 'jog':
         preset = int(sys.argv[2]) if len(sys.argv) > 2 else 0
         node.call_set_mode('JOG', jog_preset=preset)

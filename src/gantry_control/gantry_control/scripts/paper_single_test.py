@@ -61,7 +61,9 @@ METHODS = {
     "pulse": "pulse",
     "is1": "adaptive",
     "is2": "colleague-paper-closed",
+    "nonrobust": "zv",
     "robust": "robust",
+    "zv": "zv",
 }
 
 
@@ -76,14 +78,21 @@ def parse_args():
     parser.add_argument("--target-distance-mm", type=float, default=750.0)
     parser.add_argument("--vmax-mm-s", type=float, default=150.0)
     parser.add_argument("--max-travel-mm", type=float, default=800.0)
-    parser.add_argument("--residual-window", type=float, default=3.0)
-    parser.add_argument("--k", type=float, default=0.4)
+    parser.add_argument("--residual-window", type=float, default=10.0)
+    parser.add_argument("--k", type=float, default=0.05)
     parser.add_argument("--tau", type=float, default=2.0)
     parser.add_argument("--min-id-duration", type=float, default=0.45)
     parser.add_argument("--id-period", type=float, default=4.0)
-    parser.add_argument("--id-method", choices=("integral", "paper2-step"), default="integral")
+    parser.add_argument(
+        "--id-method",
+        choices=("integral", "paper2-step", "zero-zeta-ls", "freq-bank"),
+        default="integral",
+    )
+    parser.add_argument("--eq21-input-model", choices=("measured_cart", "ideal_k"), default="measured_cart")
+    parser.add_argument("--final-id-source", choices=("active_id", "zero_zeta"), default="active_id")
     parser.add_argument("--id-lowpass-hz", type=float, default=0.0)
-    parser.add_argument("--integral-id-window-s", type=float, default=0.0)
+    parser.add_argument("--integral-id-window-s", type=float, default=1.6)
+    parser.add_argument("--id-assume-zero-zeta", action="store_true")
     parser.add_argument("--mode-fit-window-s", type=float, default=1.00)
     parser.add_argument("--mode-fit-history-s", type=float, default=2.00)
     parser.add_argument("--mode-fit-after-s", type=float, default=0.80)
@@ -96,6 +105,17 @@ def parse_args():
     parser.add_argument("--mode-fit-max-norm-rmse", type=float, default=0.85)
     parser.add_argument("--mode-fit-cond-weight", type=float, default=0.01)
     parser.add_argument("--mode-fit-edge-margin-s", type=float, default=0.02)
+    parser.add_argument("--zero-zeta-window-s", type=float, default=0.0)
+    parser.add_argument("--zero-zeta-history-s", type=float, default=4.0)
+    parser.add_argument("--zero-zeta-after-s", type=float, default=0.8)
+    parser.add_argument("--zero-zeta-update-period-s", type=float, default=0.10)
+    parser.add_argument("--zero-zeta-min-samples", type=int, default=80)
+    parser.add_argument("--zero-zeta-t-min", type=float, default=0.45)
+    parser.add_argument("--zero-zeta-t-max", type=float, default=1.45)
+    parser.add_argument("--zero-zeta-grid-count", type=int, default=240)
+    parser.add_argument("--zero-zeta-min-p2p-mm", type=float, default=4.0)
+    parser.add_argument("--zero-zeta-min-amp-mm", type=float, default=1.0)
+    parser.add_argument("--zero-zeta-max-norm-rmse", type=float, default=1.5)
     parser.add_argument("--two-mode-window-s", type=float, default=1.20)
     parser.add_argument("--two-mode-history-s", type=float, default=2.00)
     parser.add_argument("--two-mode-after-s", type=float, default=0.90)
@@ -124,7 +144,7 @@ def parse_args():
     parser.add_argument("--is2-selection-window-s", type=float, default=0.5)
     parser.add_argument(
         "--is2-selection-mode",
-        choices=("median", "recent-median", "stable-window"),
+        choices=("median", "recent-median", "stable-window", "stable", "latest"),
         default="recent-median",
     )
     parser.add_argument("--is2-stable-window-s", type=float, default=0.50)
@@ -151,7 +171,12 @@ def parse_args():
     )
     parser.add_argument("--fixed-id-zeta", type=float, default=0.0)
     parser.add_argument("--switch-margin", type=float, default=0.05)
-    parser.add_argument("--estimate-deadline", type=float, default=1.90)
+    parser.add_argument(
+        "--estimate-deadline",
+        type=float,
+        default=None,
+        help="Adaptive estimate deadline [s]. Default: tau-0.1 for IS2/idonly, 1.9 otherwise.",
+    )
     parser.add_argument(
         "--zv-t-min",
         type=float,
@@ -160,17 +185,30 @@ def parse_args():
     )
     parser.add_argument("--zv-t-max", type=float, default=1.25)
     parser.add_argument("--id-zeta-min", type=float, default=-0.25)
-    parser.add_argument("--zeta-max", type=float, default=0.05)
+    parser.add_argument("--zeta-max", type=float, default=0.0)
     parser.add_argument("--robust-zeta", type=float, default=0.0)
     parser.add_argument("--robust-t-scale", type=float, default=1.0)
     parser.add_argument("--stream-rate-hz", type=float, default=100.0)
     parser.add_argument("--print-period", type=float, default=0.25)
     parser.add_argument("--execute", action="store_true", help="Actually move the gantry.")
     parser.add_argument("--no-prompt", action="store_true")
+    parser.add_argument(
+        "--no-reset-origin",
+        action="store_true",
+        help="Skip the encoder origin reset that normally runs just before the move.",
+    )
     parser.add_argument("--operator", default="")
     parser.add_argument("--notes", default="")
     parser.add_argument("--zip", action="store_true", default=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.is2_selection_mode == "stable":
+        args.is2_selection_mode = "stable-window"
+    if args.estimate_deadline is None:
+        if args.method in ("idonly", "is2"):
+            args.estimate_deadline = max(0.05, args.tau - 0.1)
+        else:
+            args.estimate_deadline = 1.90
+    return args
 
 
 def safe_tag(text: str) -> str:
@@ -191,6 +229,10 @@ def make_run_id(args) -> str:
         base += f"_tau{str(args.tau).replace('.', 'p')}"
         if args.id_method == "paper2-step":
             base += "_paper2step"
+        elif args.id_method == "zero-zeta-ls":
+            base += "_zerozeta"
+        elif args.id_method == "freq-bank":
+            base += "_freqbank"
         elif args.integral_id_window_s > 0.0:
             base += f"_iw{str(args.integral_id_window_s).replace('.', 'p')}"
         if args.is2_selection_mode == "stable-window":
@@ -214,7 +256,7 @@ def build_command(args, csv_path: Path) -> list[str]:
     elif args.method == "is1":
         zv_t_min = 0.75
     elif args.method == "is2":
-        zv_t_min = 0.50
+        zv_t_min = 0.20
     else:
         zv_t_min = 0.20
     cmd = [
@@ -256,6 +298,10 @@ def build_command(args, csv_path: Path) -> list[str]:
                 f"{args.id_period:g}",
                 "--id-method",
                 args.id_method,
+                "--eq21-input-model",
+                args.eq21_input_model,
+                "--final-id-source",
+                args.final_id_source,
                 "--id-lowpass-hz",
                 f"{args.id_lowpass_hz:g}",
                 "--integral-id-window-s",
@@ -278,6 +324,28 @@ def build_command(args, csv_path: Path) -> list[str]:
                 f"{args.paper2_min_extrema:d}",
                 "--paper2-smooth-radius",
                 f"{args.paper2_smooth_radius:d}",
+                "--zero-zeta-window-s",
+                f"{args.zero_zeta_window_s:g}",
+                "--zero-zeta-history-s",
+                f"{args.zero_zeta_history_s:g}",
+                "--zero-zeta-after-s",
+                f"{args.zero_zeta_after_s:g}",
+                "--zero-zeta-update-period-s",
+                f"{args.zero_zeta_update_period_s:g}",
+                "--zero-zeta-min-samples",
+                f"{args.zero_zeta_min_samples:d}",
+                "--zero-zeta-t-min",
+                f"{args.zero_zeta_t_min:g}",
+                "--zero-zeta-t-max",
+                f"{args.zero_zeta_t_max:g}",
+                "--zero-zeta-grid-count",
+                f"{args.zero_zeta_grid_count:d}",
+                "--zero-zeta-min-p2p-mm",
+                f"{args.zero_zeta_min_p2p_mm:g}",
+                "--zero-zeta-min-amp-mm",
+                f"{args.zero_zeta_min_amp_mm:g}",
+                "--zero-zeta-max-norm-rmse",
+                f"{args.zero_zeta_max_norm_rmse:g}",
                 "--is2-selection-window-s",
                 f"{args.is2_selection_window_s:g}",
                 "--is2-selection-mode",
@@ -327,9 +395,11 @@ def build_command(args, csv_path: Path) -> list[str]:
         )
         if args.no_is2_schedule_filter:
             cmd.append("--no-is2-schedule-filter")
+        if args.id_assume_zero_zeta:
+            cmd.append("--id-assume-zero-zeta")
     if args.method == "is2":
         cmd.extend(["--tau", f"{args.tau:g}"])
-    if args.method == "robust":
+    if args.method in ("robust", "zv", "nonrobust"):
         cmd.extend(
             [
                 "--robust-rope-length-m",
@@ -394,7 +464,71 @@ def write_metadata(args, run: SingleRun, run_dir: Path):
     )
 
 
+def reset_encoder_origin() -> bool:
+    """Re-zero the payload encoder just before the move.
+
+    encoder_serial_node latches its origin once at node startup and never again,
+    so by the time a run starts the payload's rest position has usually shifted
+    from wherever that origin was captured. The resulting offset is a fixed
+    fraction of a degree, which is invisible under an unshaped pulse (+/-5 deg)
+    but dominates a shaped run (+/-0.02 deg). Zeroing here means every run's
+    swing is measured from that run's own rest position.
+    """
+    try:
+        result = subprocess.run(
+            ["ros2", "service", "call",
+             "/payload/encoder/reset_origin", "std_srvs/srv/Trigger"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        print(f"[single-test] WARNING: encoder origin reset failed: {exc}")
+        return False
+    if "success=True" not in result.stdout.replace(" ", ""):
+        detail = result.stdout.strip() or result.stderr.strip()
+        print(f"[single-test] WARNING: encoder origin reset not confirmed: {detail}")
+        return False
+    print("[single-test] Encoder origin reset.")
+    return True
+
+
 def run_process(run: SingleRun) -> int:
+    def player_pids_for_run() -> list[int]:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-af", PLAYER],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return []
+
+        pids: list[int] = []
+        for line in result.stdout.splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2:
+                continue
+            pid_text, cmdline = parts
+            if run.csv_path not in cmdline:
+                continue
+            try:
+                pids.append(int(pid_text))
+            except ValueError:
+                continue
+        return pids
+
+    def stop_detached_player(sig: int) -> None:
+        for pid in player_pids_for_run():
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
     def stop_process_tree(proc: subprocess.Popen, sig: int) -> None:
         try:
             os.killpg(proc.pid, sig)
@@ -434,11 +568,13 @@ def run_process(run: SingleRun) -> int:
                         log.write("[single-test] Player printed final report but did not exit; terminating so plots can be generated.\n")
                         log.flush()
                         stop_process_tree(proc, signal.SIGTERM)
+                        stop_detached_player(signal.SIGTERM)
                     break
             try:
                 remaining, _ = proc.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:
                 stop_process_tree(proc, signal.SIGKILL)
+                stop_detached_player(signal.SIGKILL)
                 try:
                     remaining, _ = proc.communicate(timeout=2.0)
                 except subprocess.TimeoutExpired:
@@ -453,10 +589,12 @@ def run_process(run: SingleRun) -> int:
             log.write("[single-test] Interrupted; stopping player and analyzing any completed CSV data.\n")
             log.flush()
             stop_process_tree(proc, signal.SIGTERM)
+            stop_detached_player(signal.SIGTERM)
             try:
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 stop_process_tree(proc, signal.SIGKILL)
+                stop_detached_player(signal.SIGKILL)
                 try:
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
@@ -571,6 +709,271 @@ def first_source(rows) -> str:
     return ""
 
 
+RESIDUAL_GUARDS_S = (0.0, 0.2, 0.5, 1.0)
+
+
+def guard_tag(guard_s: float) -> str:
+    return str(guard_s).replace(".", "p")
+
+
+def row_float(row: dict[str, float | str], key: str, default: float = math.nan) -> float:
+    value = row.get(key, default)
+    if isinstance(value, (float, int)) and math.isfinite(float(value)):
+        return float(value)
+    return default
+
+
+def column_series(rows, key: str, default: float = math.nan) -> np.ndarray:
+    return np.array([row_float(row, key, default) for row in rows], dtype=float)
+
+
+def command_axis_columns(run: SingleRun) -> tuple[str, str]:
+    axis = "x"
+    for i, part in enumerate(run.command):
+        if part == "--axis" and i + 1 < len(run.command):
+            axis = run.command[i + 1]
+            break
+    return f"cmd_v{axis}_mm_s", f"cart_v{axis}_mm_s"
+
+
+def swing_angle_series(rows, run: SingleRun) -> tuple[np.ndarray, str]:
+    """Return encoder angle samples for the commanded axis, never mm-derived."""
+    axis = "x"
+    for i, part in enumerate(run.command):
+        if part == "--axis" and i + 1 < len(run.command):
+            axis = run.command[i + 1]
+            break
+    candidates = ["swing_axis_angle_deg"]
+    if axis == "x":
+        candidates.extend(["swing_pitch_deg", "enc_pitch_deg"])
+    else:
+        candidates.extend(["swing_roll_deg", "enc_roll_deg"])
+    for key in candidates:
+        values = column_series(rows, key)
+        if np.isfinite(values).any():
+            return values, key
+    return np.full(len(rows), np.nan), candidates[0]
+
+
+def command_event_data(rows, run: SingleRun) -> dict[str, object]:
+    t = column_series(rows, "move_time_sec")
+    cmd_col, act_col = command_axis_columns(run)
+    cmd = column_series(rows, cmd_col, 0.0)
+    act = column_series(rows, act_col)
+    finite = np.isfinite(t)
+    t = t[finite]
+    cmd = cmd[finite]
+    act = act[finite] if len(act) == len(finite) else act
+
+    switches: list[float] = []
+    if len(t) and len(cmd):
+        dcmd = np.r_[0.0, np.abs(np.diff(cmd))]
+        for ts in t[dcmd > 1.0e-6]:
+            if not switches or abs(float(ts) - switches[-1]) > 0.03:
+                switches.append(float(ts))
+
+    residual_start = math.nan
+    nonzero_seen = False
+    for ts, cv in zip(t, cmd):
+        if abs(float(cv)) > 1.0e-6:
+            nonzero_seen = True
+        elif nonzero_seen:
+            residual_start = float(ts)
+            break
+    if not math.isfinite(residual_start):
+        nonzero = np.where(np.isfinite(cmd) & (np.abs(cmd) > 1.0e-6))[0]
+        if len(nonzero):
+            residual_start = float(t[nonzero[-1]])
+        elif len(t):
+            residual_start = float(t[-1])
+
+    tf = run.target_mm / abs(run.vmax_mm_s) if abs(run.vmax_mm_s) > 1.0e-9 else math.nan
+    lock_t = last_finite(rows, "schedule_locked_at_s")
+    if not math.isfinite(lock_t) and run.method in ("idonly", "is1", "is2"):
+        lock_t = run.tau_s
+    chosen_id_t = last_finite(rows, "schedule_id_time_s")
+    return {
+        "t": t,
+        "cmd": cmd,
+        "act": act,
+        "cmd_col": cmd_col,
+        "act_col": act_col,
+        "switches": switches,
+        "residual_start": residual_start,
+        "tf": tf,
+        "lock_t": lock_t,
+        "chosen_id_t": chosen_id_t,
+    }
+
+
+def residual_metrics_from_series(
+    t: np.ndarray,
+    values: np.ndarray,
+    residual_start_s: float,
+    *,
+    prefix: str,
+    unit: str,
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if not math.isfinite(residual_start_s):
+        residual_start_s = math.nan
+    for guard in RESIDUAL_GUARDS_S:
+        tag = guard_tag(guard)
+        start = residual_start_s + guard if math.isfinite(residual_start_s) else math.nan
+        mask = np.isfinite(t) & np.isfinite(values)
+        if math.isfinite(start):
+            mask &= t >= start
+        vals = values[mask]
+        base = f"{prefix}_guard_{tag}"
+        out[f"{base}_samples"] = float(len(vals))
+        if len(vals) == 0:
+            out[f"{base}_p2p_{unit}"] = math.nan
+            out[f"{base}_max_abs_{unit}"] = math.nan
+            out[f"{base}_rms_{unit}"] = math.nan
+            out[f"{base}_rms_demeaned_{unit}"] = math.nan
+            out[f"{base}_mean_{unit}"] = math.nan
+            continue
+        centered = vals - float(np.mean(vals))
+        out[f"{base}_p2p_{unit}"] = float(np.max(vals) - np.min(vals))
+        out[f"{base}_max_abs_{unit}"] = float(np.max(np.abs(vals)))
+        out[f"{base}_rms_{unit}"] = float(np.sqrt(np.mean(vals * vals)))
+        out[f"{base}_rms_demeaned_{unit}"] = float(np.sqrt(np.mean(centered * centered)))
+        out[f"{base}_mean_{unit}"] = float(np.mean(vals))
+    return out
+
+
+def write_residual_report(run_dir: Path, summary: dict[str, object]) -> None:
+    lines = [
+        "Residual Guard Sensitivity",
+        "",
+        "Metrics start at command-zero plus guard. RMS demeaned removes static offset.",
+        "",
+        "guard_s,p2p_mm,rms_demeaned_mm,p2p_deg,rms_demeaned_deg",
+    ]
+    for guard in RESIDUAL_GUARDS_S:
+        tag = guard_tag(guard)
+        lines.append(
+            f"{guard:g},"
+            f"{summary.get(f'residual_guard_{tag}_p2p_mm', math.nan)},"
+            f"{summary.get(f'residual_guard_{tag}_rms_demeaned_mm', math.nan)},"
+            f"{summary.get(f'residual_angle_guard_{tag}_p2p_deg', math.nan)},"
+            f"{summary.get(f'residual_angle_guard_{tag}_rms_demeaned_deg', math.nan)}"
+        )
+    (run_dir / "residual_report.txt").write_text("\n".join(lines))
+
+
+def add_event_lines(
+    ax,
+    events: dict[str, object],
+    *,
+    include_residual: bool = False,
+    include_guard: bool = False,
+    annotate_switches: bool = True,
+    label_prefix: str = "",
+) -> None:
+    lock_t = float(events.get("lock_t", math.nan))
+    tf = float(events.get("tf", math.nan))
+    residual_start = float(events.get("residual_start", math.nan))
+    switches = events.get("switches", [])
+
+    if math.isfinite(lock_t):
+        ax.axvline(
+            lock_t,
+            color="black",
+            linestyle="-.",
+            linewidth=1.6,
+            alpha=0.85,
+            label=f"{label_prefix}ID lock",
+        )
+    if math.isfinite(tf):
+        ax.axvline(
+            tf,
+            color="tab:purple",
+            linestyle=":",
+            linewidth=1.8,
+            alpha=0.9,
+            label=f"{label_prefix}tf",
+        )
+    if include_residual and math.isfinite(residual_start):
+        ax.axvline(
+            residual_start,
+            color="tab:red",
+            linestyle="-",
+            linewidth=1.5,
+            alpha=0.75,
+            label=f"{label_prefix}command zero",
+        )
+        if include_guard:
+            for guard in (0.2, 0.5, 1.0):
+                ax.axvline(
+                    residual_start + guard,
+                    color="tab:red",
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.25 if guard != 0.5 else 0.55,
+                    label=f"{label_prefix}+{guard:g}s guard" if guard == 0.5 else None,
+                )
+
+    ymin, ymax = ax.get_ylim()
+    y_text = ymin + 0.92 * (ymax - ymin)
+    for i, ts in enumerate(switches if isinstance(switches, list) else []):
+        if not math.isfinite(float(ts)):
+            continue
+        if math.isfinite(lock_t) and abs(float(ts) - lock_t) < 0.04:
+            continue
+        if math.isfinite(tf) and abs(float(ts) - tf) < 0.04:
+            continue
+        if include_residual and math.isfinite(residual_start) and abs(float(ts) - residual_start) < 0.04:
+            continue
+        ax.axvline(float(ts), color="0.35", linestyle="--", linewidth=0.9, alpha=0.28)
+        if annotate_switches:
+            ax.text(float(ts), y_text, f"s{i}", rotation=90, va="top", ha="right", fontsize=8)
+
+
+def plot_velocity_with_events(
+    rows: list[dict[str, float | str]],
+    run: SingleRun,
+    plots: Path,
+    events: dict[str, object],
+) -> None:
+    t = np.asarray(events["t"], dtype=float)
+    cmd = np.asarray(events["cmd"], dtype=float)
+    act = np.asarray(events["act"], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(12, 4.6))
+    ax.plot(t, cmd, label=f"commanded ({events['cmd_col']})", linewidth=2.0)
+    if len(act) == len(t) and np.isfinite(act).any():
+        ax.plot(t, act, label=f"actual ({events['act_col']})", linewidth=1.4, alpha=0.9)
+    ax.set_xlabel("move time [s]")
+    ax.set_ylabel("velocity [mm/s]")
+    ax.set_title("Commanded vs actual cart velocity with events")
+    ax.grid(True, alpha=0.3)
+    add_event_lines(ax, events)
+    ax.legend(loc="best")
+    save_fig(plots / "cmd_vs_actual_velocity_with_events.png")
+
+
+def plot_signal_with_events(
+    t: np.ndarray,
+    values: np.ndarray,
+    *,
+    title: str,
+    ylabel: str,
+    out_path: Path,
+    events: dict[str, object],
+) -> None:
+    fig, ax = plt.subplots(figsize=(12, 4.8))
+    ax.plot(t, values, linewidth=1.5, label=ylabel)
+    ax.axhline(0.0, color="0.25", linestyle="--", linewidth=0.9, alpha=0.55)
+    ax.set_xlabel("move time [s]")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    add_event_lines(ax, events, include_residual=True, include_guard=True)
+    ax.legend(loc="best")
+    save_fig(out_path)
+
+
 def analyze(run: SingleRun, run_dir: Path):
     rows = read_rows(Path(run.csv_path))
     summary = {
@@ -583,22 +986,11 @@ def analyze(run: SingleRun, run_dir: Path):
         "status": "ok" if rows else "missing_or_empty",
     }
     if rows:
-        cmd = [
-            abs(float(r.get("cmd_vx_mm_s", 0.0) or 0.0))
-            + abs(float(r.get("cmd_vy_mm_s", 0.0) or 0.0))
-            for r in rows
-        ]
-        times = [float(r.get("move_time_sec", math.nan)) for r in rows]
-        last_motion_idx = max((i for i, v in enumerate(cmd) if math.isfinite(v) and v > 1.0e-6), default=len(rows) - 1)
-        stop_time = times[last_motion_idx]
-        residual = [
-            float(r["swing_mm"])
-            for r in rows
-            if isinstance(r.get("swing_mm"), (float, int))
-            and math.isfinite(float(r["swing_mm"]))
-            and isinstance(r.get("move_time_sec"), (float, int))
-            and float(r["move_time_sec"]) >= stop_time
-        ]
+        t_arr = column_series(rows, "move_time_sec")
+        swing_mm = column_series(rows, "swing_mm")
+        swing_deg, swing_deg_source = swing_angle_series(rows, run)
+        events = command_event_data(rows, run)
+        stop_time = float(events["residual_start"])
         travel = last_finite(rows, "traveled_mm")
         first_id_row = first_finite_row(rows, "T_sec")
         last_id_row = last_finite_row_until(
@@ -614,16 +1006,17 @@ def analyze(run: SingleRun, run_dir: Path):
         chosen_id_T = last_finite(rows, "schedule_id_T_sec")
         if not math.isfinite(chosen_id_T):
             chosen_id_T = schedule_T
+        residual_mm_metrics = residual_metrics_from_series(
+            t_arr, swing_mm, stop_time, prefix="residual", unit="mm")
+        residual_deg_metrics = residual_metrics_from_series(
+            t_arr, swing_deg, stop_time, prefix="residual_angle", unit="deg")
         summary.update(
             {
                 "travel_actual_mm": travel,
                 "travel_error_mm": travel - run.target_mm if math.isfinite(travel) else math.nan,
                 "command_stop_time_s": stop_time,
                 "run_duration_s": last_finite(rows, "move_time_sec"),
-                "residual_samples": len(residual),
-                "residual_p2p_mm": max(residual) - min(residual) if residual else math.nan,
-                "residual_max_abs_mm": max(abs(v) for v in residual) if residual else math.nan,
-                "residual_rms_mm": math.sqrt(sum(v * v for v in residual) / len(residual)) if residual else math.nan,
+                "residual_angle_source": swing_deg_source,
                 "id_first_valid_time_s": first_finite_time(rows, "T_sec"),
                 "id_first_valid_T_s": finite_from_row(first_id_row, "T_sec"),
                 "id_period_s": run.id_period_s,
@@ -646,6 +1039,27 @@ def analyze(run: SingleRun, run_dir: Path):
                 "id_cond_b": last_finite(rows, "cond_b"),
             }
         )
+        summary.update(residual_mm_metrics)
+        summary.update(residual_deg_metrics)
+        summary.update(
+            {
+                # Compatibility aliases: immediate, no-guard residual in mm.
+                "residual_samples": int(summary.get("residual_guard_0p0_samples", 0.0)),
+                "residual_p2p_mm": summary.get("residual_guard_0p0_p2p_mm", math.nan),
+                "residual_max_abs_mm": summary.get("residual_guard_0p0_max_abs_mm", math.nan),
+                "residual_rms_mm": summary.get("residual_guard_0p0_rms_mm", math.nan),
+                "residual_rms_demeaned_mm": summary.get(
+                    "residual_guard_0p0_rms_demeaned_mm", math.nan),
+                "residual_angle_samples": int(summary.get("residual_angle_guard_0p0_samples", 0.0)),
+                "residual_angle_p2p_deg": summary.get("residual_angle_guard_0p0_p2p_deg", math.nan),
+                "residual_angle_max_abs_deg": summary.get(
+                    "residual_angle_guard_0p0_max_abs_deg", math.nan),
+                "residual_angle_rms_deg": summary.get("residual_angle_guard_0p0_rms_deg", math.nan),
+                "residual_angle_rms_demeaned_deg": summary.get(
+                    "residual_angle_guard_0p0_rms_demeaned_deg", math.nan),
+            }
+        )
+        write_residual_report(run_dir, summary)
         plot_single(rows, run, run_dir)
 
     with (run_dir / "summary_metrics.csv").open("w", newline="") as f:
@@ -661,41 +1075,101 @@ def analyze(run: SingleRun, run_dir: Path):
 def plot_single(rows, run: SingleRun, run_dir: Path):
     plots = run_dir / "plots"
     plots.mkdir(exist_ok=True)
-    t = [float(r.get("move_time_sec", math.nan)) for r in rows]
-    vx = [float(r.get("cmd_vx_mm_s", 0.0) or 0.0) for r in rows]
-    travel = [float(r.get("traveled_mm", math.nan)) for r in rows]
-    swing = [float(r.get("swing_mm", math.nan)) for r in rows]
-    filtered_swing = [float(r.get("id_filtered_swing_mm", math.nan)) for r in rows]
+    t = column_series(rows, "move_time_sec")
+    travel = column_series(rows, "traveled_mm")
+    swing = column_series(rows, "swing_mm")
+    swing_angle, swing_angle_source = swing_angle_series(rows, run)
+    filtered_swing = column_series(rows, "id_filtered_swing_mm")
+    events = command_event_data(rows, run)
+    cmd = np.asarray(events["cmd"], dtype=float)
 
-    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-    axes[0].plot(t, vx, linewidth=2)
-    axes[0].set_ylabel("cmd vx [mm/s]")
+    fig, axes = plt.subplots(4, 1, figsize=(11, 11), sharex=True)
+    axes[0].plot(np.asarray(events["t"], dtype=float), cmd, linewidth=2)
+    axes[0].set_ylabel("cmd vel [mm/s]")
     axes[1].plot(t, travel, linewidth=2)
     axes[1].axhline(run.target_mm, color="black", linestyle="--", alpha=0.4)
     axes[1].set_ylabel("travel [mm]")
     axes[2].plot(t, swing, linewidth=1.4, alpha=0.65, label="raw swing")
-    if any(math.isfinite(v) for v in filtered_swing):
+    if np.isfinite(filtered_swing).any():
         axes[2].plot(t, filtered_swing, linewidth=2.0, color="tab:orange", label="ID low-pass swing")
         axes[2].legend(loc="best")
     axes[2].set_ylabel("swing [mm]")
-    axes[2].set_xlabel("move time [s]")
+    axes[3].plot(t, swing_angle, linewidth=1.4, color="tab:green", label=swing_angle_source)
+    axes[3].set_ylabel("swing angle [deg]")
+    axes[3].set_xlabel("move time [s]")
     axes[0].set_title(run.run_id)
     for ax in axes:
+        add_event_lines(ax, events, include_residual=False, annotate_switches=False)
         ax.grid(True, alpha=0.3)
     save_fig(plots / "run_stack.png")
 
-    cmd_abs = [abs(v) for v in vx]
-    last_motion_idx = max((i for i, v in enumerate(cmd_abs) if math.isfinite(v) and v > 1.0e-6), default=len(rows) - 1)
-    stop_time = t[last_motion_idx]
-    rt = [ti - stop_time for ti in t if ti >= stop_time]
-    rs = [swing[i] for i, ti in enumerate(t) if ti >= stop_time]
+    residual_start = float(events.get("residual_start", math.nan))
+    if not math.isfinite(residual_start):
+        residual_start = float(np.nanmax(t)) if np.isfinite(t).any() else 0.0
+    rt = t - residual_start
+    mask = np.isfinite(rt) & (rt >= 0.0)
+
+    # Magnetic encoders (pose_e / pose_e_rel) carry a fixed mechanical zero
+    # offset that isn't meaningful swing — demean so residual drift is easy to
+    # read. Camera-sourced swing (/payload/state, /payload/pose) has no such
+    # offset, so leave it as measured.
+    is_encoder_source = "pose_e" in run.payload_topic
+
     plt.figure(figsize=(10, 4))
-    plt.plot(rt, rs, linewidth=2)
+    if is_encoder_source:
+        swing_offset_mm = float(np.nanmean(swing[mask])) if mask.any() else 0.0
+        swing_demeaned = swing[mask] - swing_offset_mm
+        plt.plot(rt[mask], swing[mask], linewidth=1.2, alpha=0.35, color="tab:blue", label="raw")
+        plt.plot(rt[mask], swing_demeaned, linewidth=2, color="tab:blue",
+                  label=f"demeaned (offset {swing_offset_mm:+.2f} mm)")
+        plt.axhline(0.0, color="black", linewidth=0.8, alpha=0.4)
+        plt.legend(loc="best", fontsize=8)
+    else:
+        plt.plot(rt[mask], swing[mask], linewidth=2, color="tab:blue")
+    for guard in (0.2, 0.5, 1.0):
+        plt.axvline(guard, color="tab:red", linestyle="--", alpha=0.25 if guard != 0.5 else 0.55)
     plt.xlabel("time after command zero [s]")
     plt.ylabel("residual swing [mm]")
-    plt.title("Residual swing")
+    plt.title("Residual swing [mm]")
     plt.grid(True, alpha=0.3)
     save_fig(plots / "residual_swing.png")
+
+    plt.figure(figsize=(10, 4))
+    if is_encoder_source:
+        swing_angle_offset_deg = float(np.nanmean(swing_angle[mask])) if mask.any() else 0.0
+        swing_angle_demeaned = swing_angle[mask] - swing_angle_offset_deg
+        plt.plot(rt[mask], swing_angle[mask], linewidth=1.2, alpha=0.35, color="tab:green", label="raw")
+        plt.plot(rt[mask], swing_angle_demeaned, linewidth=2, color="tab:green",
+                  label=f"demeaned (offset {swing_angle_offset_deg:+.3f} deg)")
+        plt.axhline(0.0, color="black", linewidth=0.8, alpha=0.4)
+        plt.legend(loc="best", fontsize=8)
+    else:
+        plt.plot(rt[mask], swing_angle[mask], linewidth=2, color="tab:green")
+    for guard in (0.2, 0.5, 1.0):
+        plt.axvline(guard, color="tab:red", linestyle="--", alpha=0.25 if guard != 0.5 else 0.55)
+    plt.xlabel("time after command zero [s]")
+    plt.ylabel("residual swing angle [deg]")
+    plt.title("Residual swing angle")
+    plt.grid(True, alpha=0.3)
+    save_fig(plots / "residual_swing_angle.png")
+
+    plot_velocity_with_events(rows, run, plots, events)
+    plot_signal_with_events(
+        t,
+        swing,
+        title="Payload swing [mm] with ID lock, switches, tf, and residual guard",
+        ylabel="swing [mm]",
+        out_path=plots / "swing_mm_with_events.png",
+        events=events,
+    )
+    plot_signal_with_events(
+        t,
+        swing_angle,
+        title="Payload swing angle with ID lock, switches, tf, and residual guard",
+        ylabel="swing angle [deg]",
+        out_path=plots / "swing_angle_with_events.png",
+        events=events,
+    )
 
     if run.method != "pulse" or run.id_method != "integral":
         candidates = [] if run.id_method == "paper2-step" else id_candidate_points(rows)
@@ -874,7 +1348,9 @@ def main():
     print(shell_quote(command))
     if args.execute:
         if not args.no_prompt:
-            input("Confirm rope length, reset payload origin, clear workspace, then press Enter...")
+            input("Confirm rope length, clear workspace, let the payload settle, then press Enter...")
+        if not args.no_reset_origin:
+            reset_encoder_origin()
         code = run_process(run)
         if code != 0:
             print(f"[single-test] WARNING: player exited with code {code}")

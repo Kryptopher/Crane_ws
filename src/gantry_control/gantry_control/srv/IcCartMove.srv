@@ -1,0 +1,6 @@
+# Command the initial-condition cart to an absolute X position.
+float64 position_mm     # target X in mm, relative to the last calibrated origin
+float64 velocity_mm_s   # cruise speed for this move; <= 0 keeps the current speed
+---
+bool success
+string message

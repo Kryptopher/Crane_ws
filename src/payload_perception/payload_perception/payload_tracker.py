@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import math
 import os
 import queue
@@ -762,22 +763,50 @@ class ArucoTracker:
                 registry[base_id + idx] = (pos, rot, face)
         return registry
 
+    _FACE_NAME_MAP = {
+        'plus_x': 'front', 'minus_x': 'back',
+        'minus_z': 'right', 'plus_z': 'left',
+    }
+    _FACE_ROTATION_MAP = {
+        'front': _R_FRONT, 'back': _R_BACK,
+        'right': _R_RIGHT, 'left': _R_LEFT,
+    }
+
+    @classmethod
+    def _build_tag_registry_from_json(cls, layout_path: str):
+        with open(layout_path, 'r') as f:
+            data = json.load(f)
+        registry = {}
+        face_groups: dict[str, set[int]] = {}
+        for tag in data['tags']:
+            tid = int(tag['id'])
+            face_key = tag['face']
+            face_name = cls._FACE_NAME_MAP.get(face_key, face_key)
+            rot = cls._FACE_ROTATION_MAP.get(face_name, np.eye(3, dtype=np.float64))
+            center = np.array(tag['center_m'], dtype=np.float64)
+            registry[tid] = (center, rot, face_name)
+            face_groups.setdefault(face_name, set()).add(tid)
+        return registry, face_groups
+
     def __init__(self, marker_size=0.10, tag_family='tagStandard41h12',
                  decision_margin_min=12.0, nthreads=4, quad_decimate=2.0,
                  aruco_dict=None, debug_detect=False, rigid_body_pnp=True,
-                 rigid_reproj_max_px=8.0):
+                 rigid_reproj_max_px=8.0, layout_path=None):
         if aruco_dict and not tag_family:
             tag_family = aruco_dict
         self.marker_size = marker_size
         self.decision_margin_min = decision_margin_min
-        self.tag_registry = self._build_tag_registry()
+        if layout_path is not None:
+            self.tag_registry, self.face_groups = self._build_tag_registry_from_json(layout_path)
+        else:
+            self.tag_registry = self._build_tag_registry()
+            self.face_groups = {
+                'front': {0, 1, 2},
+                'right': {3, 4, 5},
+                'back': {6, 7, 8},
+                'left': {9, 10, 11},
+            }
         self.valid_ids = set(self.tag_registry.keys())
-        self.face_groups = {
-            'front': {0, 1, 2},
-            'right': {3, 4, 5},
-            'back': {6, 7, 8},
-            'left': {9, 10, 11},
-        }
         self.detector = Detector(
             families=tag_family, nthreads=nthreads,
             quad_decimate=quad_decimate, refine_edges=1,
@@ -1611,6 +1640,8 @@ def main():
         '--rigid-reproj-max-px', type=float, default=8.0,
         help='Fallback to tag averaging if rigid solve RMS reprojection exceeds this',
     )
+    parser.add_argument('--layout', type=str, default=None,
+                        help='Path to tag_layout JSON (overrides hardcoded face mapping)')
     parser.add_argument('--csv-dir', type=str, default='~/payload_logs')
     parser.add_argument('--x-range', type=float, default=1.0,
                         help='Minimum half-span for top-down X (m); auto-zoom includes 0')
@@ -1666,6 +1697,7 @@ def main():
         debug_detect=args.debug_detect,
         rigid_body_pnp=not args.no_rigid_body_pnp,
         rigid_reproj_max_px=args.rigid_reproj_max_px,
+        layout_path=args.layout,
     )
     if args.turbo:
         tracker._remap_interp = cv2.INTER_NEAREST

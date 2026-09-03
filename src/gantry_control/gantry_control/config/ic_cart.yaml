@@ -1,0 +1,23 @@
+# Initial-condition cart: Arduino Nano + TB6600 + NEMA17 over USB serial.
+#
+# The payload encoder Nano is an identical CH340 with no by-id symlink, so
+# /dev/ttyCH341USB0 vs USB1 is assigned by enumeration order. The node verifies
+# the telemetry shape on open and refuses to run against the wrong board.
+
+ic_cart_node:
+  ros__parameters:
+    serial_port: /dev/ttyCH341USB1
+    baud: 115200
+    publish_rate_hz: 50.0
+
+    # Default cruise speed; the dashboard overrides this per move.
+    cruise_speed_mm_s: 15.0
+    # Keep in sync with MAX_SPEED_MM_S in arduino_nano_ic_cart_stepper.ino.
+    max_velocity_mm_s: 60.0
+
+    # Soft travel limits about the calibrated origin. Tighten these once the
+    # rail's usable stroke is measured.
+    min_position_mm: -1000.0
+    max_position_mm: 1000.0
+
+    stale_timeout_s: 0.5

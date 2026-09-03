@@ -23,7 +23,10 @@ setup(
             'encoder_serial_node = payload_perception.encoder_serial_node:main',
             'payload_relative_node = payload_perception.payload_relative_node:main',
             'test_publish_payload_state = payload_perception.test_publish_payload_state:main',
+            'test_publish_imu_raw = payload_perception.test_publish_imu_raw:main',
             'payload_gantry_frame = payload_perception.payload_gantry_frame:main',
+            'phase1_tracker_node = payload_perception.phase1_tracker_node:main',
+            'encoder_diagnostics_logger = payload_perception.encoder_diagnostics_logger:main',
         ],
     },
 )

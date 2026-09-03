@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <fstream>
 #include <sstream>
@@ -31,6 +32,7 @@
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "gantry_control/srv/set_mode.hpp"
 #include "gantry_control/srv/move_to.hpp"
+#include "gantry_control/srv/execute_timed_profile.hpp"
 
 namespace gantry_control
 {
@@ -127,6 +129,9 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::Publisher<gantry_control::msg::TrajCmd>::SharedPtr traj_cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr read_timing_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr traj_latency_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr home_sensors_pub_;
 
   // Subscribers
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_sub_;
@@ -141,16 +146,23 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_estop_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr enable_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr disable_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr force_home_srv_;
+  rclcpp::Service<gantry_control::srv::ExecuteTimedProfile>::SharedPtr
+    execute_timed_profile_srv_;
 
   // Timers
   rclcpp::TimerBase::SharedPtr control_timer_;   // 100Hz main loop
   rclcpp::TimerBase::SharedPtr state_timer_;      // 50Hz state publisher
+  rclcpp::TimerBase::SharedPtr home_sensors_timer_;  // 10Hz home-input diagnostics
 
   // ──────────────────────────────────────────────────────────────────────────
   // Callbacks
   // ──────────────────────────────────────────────────────────────────────────
   void control_loop();
   void publish_state();
+  /** 10 Hz dump of the raw SC4-hub home inputs + derived active flags, for
+   *  verifying home-sensor wiring/polarity. Topic: /gantry/home_sensors. */
+  void publish_home_sensors();
   void publish_gantry_odometry(const rclcpp::Time & stamp);
   void joy_callback(const sensor_msgs::msg::Joy::SharedPtr msg);
   void traj_cmd_callback(const gantry_control::msg::TrajCmd::SharedPtr msg);
@@ -177,6 +189,13 @@ private:
   void disable_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  /** Force the current gantry position to be the software home, with no seek. */
+  void force_home_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  void execute_timed_profile_callback(
+    const std::shared_ptr<gantry_control::srv::ExecuteTimedProfile::Request> request,
+    std::shared_ptr<gantry_control::srv::ExecuteTimedProfile::Response> response);
 
   // ──────────────────────────────────────────────────────────────────────────
   // Mode executors (called from control_loop)
@@ -186,29 +205,39 @@ private:
   void execute_homing_sensor_inputs();
   void execute_homing_teknic();
   void begin_homing(PendingRunKind pending, Mode resume_mode);
+  /** Raw hub input level (true = electrically asserted), no polarity applied. */
+  bool read_hub_input_raw(size_t node_index, bool input_b);
   bool read_home_hub_input(size_t node_index, bool input_b, bool active_high);
   bool home_left_sensor_active();
   bool home_back_sensor_active();
+  bool hardware_estop_sensor_active();
+  void monitor_hardware_estop();
   bool home_sensors_both_active_debounced();
   void reset_home_input_debounce();
   void fail_homing(const std::string & reason);
   void finalize_homing_success();
+  /** Capture current motor positions as the home reference and zero the cart
+   *  pose. Shared by sensor homing and the /gantry/force_home override.
+   *  Returns false if the motor encoders could not be read. */
+  bool set_home_reference_here();
   void dispatch_pending_run();
   void do_start_traj_execution();
-  void do_start_traj_realtime();
+  void do_start_traj_realtime(bool reset_stream_command = true);
   void do_start_csv_run();
   void execute_jog();
   void execute_csv();
   void execute_traj();
   void execute_mission();
   void start_traj_execution();
-  void start_traj_realtime();
+  void start_traj_realtime(bool reset_stream_command = true);
   bool check_motor_homing_valid();
   void publish_motion_start();
   void publish_traj_playback(double profile_time_s);
   void publish_traj_playback_realtime(double profile_time_s, double vx_mm_s, double vy_mm_s);
   void clear_traj_profile();
   bool send_cartesian_velocity(double vx_ms, double vy_ms);
+  bool send_traj_cartesian_velocity(double vx_ms, double vy_ms, bool force = false);
+  void reset_traj_write_cache();
   bool check_workspace_position();
   void clamp_velocity_to_workspace(double & vx_ms, double & vy_ms);
   void trip_workspace_limit(const char * axis_label, double value_m);
@@ -281,6 +310,7 @@ private:
   sFnd::IPort * port_;
   sFnd::INode * node_a_;   // Motor A
   sFnd::INode * node_b_;   // Motor B
+  int teknic_baud_rate_;
 
   // ──────────────────────────────────────────────────────────────────────────
   // System state (protected by mutex for service callbacks)
@@ -315,6 +345,13 @@ private:
   int homing_input_debounce_ticks_;
   int homing_left_debounce_count_;
   int homing_back_debounce_count_;
+  bool hardware_estop_enable_;
+  size_t hardware_estop_node_;
+  bool hardware_estop_input_b_;
+  bool hardware_estop_active_high_;
+  int hardware_estop_debounce_ticks_;
+  int hardware_estop_debounce_count_;
+  bool hardware_estop_input_active_;
   bool publish_odom_;
   bool publish_odom_tf_;
   std::string odom_frame_id_;
@@ -333,6 +370,18 @@ private:
   double cart_y_m_;             // Cartesian Y position (meters)
   double cart_vx_ms_;           // Cartesian X velocity (m/s)
   double cart_vy_ms_;           // Cartesian Y velocity (m/s)
+  double cart_vx_measured_ms_;
+  double cart_vy_measured_ms_;
+  double cart_vx_from_position_ms_;
+  double cart_vy_from_position_ms_;
+  double last_cart_x_for_velocity_m_;
+  double last_cart_y_for_velocity_m_;
+  double position_velocity_alpha_;
+  bool position_velocity_initialized_;
+  std::chrono::steady_clock::time_point last_position_velocity_time_;
+  std::string cart_velocity_source_;
+  int motor_velocity_read_every_n_;
+  int motor_velocity_read_counter_;
 
   // Home offsets (encoder counts at home position)
   int32_t home_offset_a_;
@@ -353,16 +402,16 @@ private:
   double joy_axis_sign_y_;      // stick → cart +Y (lab: up = +Y)
 
   // ──────────────────────────────────────────────────────────────────────────
-  // ZV Jog state
+  // ZVD Jog state (robust 3-impulse Zero-Vibration-Derivative input shaper)
   // ──────────────────────────────────────────────────────────────────────────
-  enum class ZvState { IDLE, RAMP_UP_1, FULL_SPEED, RAMP_DOWN_1 };
+  enum class ZvState { IDLE, RAMP_UP_1, RAMP_UP_2, FULL_SPEED, RAMP_DOWN_1, RAMP_DOWN_2 };
   ZvState zv_state_;
   std::chrono::steady_clock::time_point zv_transition_time_;
-  double zv_T_;                 // Shaper half-period (seconds)
-  double zv_A_;                 // Max speed (m/s)
+  double zv_T_;                 // Impulse spacing = pi / omega_d (seconds)
+  double zv_zeta_;              // Damping ratio used for ZVD amplitude computation
   double zv_dir_x_;             // Direction: -1, 0, or +1
   double zv_dir_y_;             // Direction: -1, 0, or +1
-  bool zv_button_held_;         // D-pad held state
+  bool zv_button_held_;         // Stick+LB held state
 
   // ──────────────────────────────────────────────────────────────────────────
   // Mission state
@@ -371,6 +420,9 @@ private:
   double mission_target_y_;
   double mission_move_vel_ms_;
   double mission_move_accel_ms2_;
+  // Runtime retuning of the move limits above (dashboard experiment runs
+  // command a specific velocity per move via /gantry_controller/set_parameters).
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 
   // ──────────────────────────────────────────────────────────────────────────
   // TRAJ state (/traj_cmd from traj_player.py)
@@ -383,9 +435,32 @@ private:
   bool traj_abort_;
   bool traj_realtime_enable_;
   bool traj_realtime_active_;
+  bool timed_profile_armed_;
+  bool precise_profile_timing_;
+  std::chrono::steady_clock::time_point timed_profile_start_time_;
+  double timed_profile_start_ros_s_;
   double stream_vx_mm_s_;
   double stream_vy_mm_s_;
   double traj_stream_timeout_s_;
+  bool traj_write_on_change_only_;
+  double traj_write_keepalive_s_;
+  double traj_write_deadband_mm_s_;
+  double last_sent_traj_vx_ms_;
+  double last_sent_traj_vy_ms_;
+  bool last_sent_traj_velocity_valid_;
+  std::chrono::steady_clock::time_point last_traj_write_time_;
+  uint64_t traj_stream_seq_{0};
+  uint64_t traj_applied_seq_{0};
+  bool traj_received_velocity_valid_{false};
+  double traj_received_vx_mm_s_{0.0};
+  double traj_received_vy_mm_s_{0.0};
+  double traj_source_stamp_s_{0.0};
+  double traj_rx_stamp_s_{0.0};
+  double traj_apply_begin_stamp_s_{0.0};
+  double traj_apply_done_stamp_s_{0.0};
+  double traj_applied_vx_mm_s_{0.0};
+  double traj_applied_vy_mm_s_{0.0};
+  double encoder_read_stamp_s_{0.0};
 
   // Gantry Cartesian workspace safety (motor encoders)
   double workspace_limit_m_;
@@ -408,6 +483,11 @@ private:
   // ──────────────────────────────────────────────────────────────────────────
   double last_read_ms_;
   double last_write_ms_;
+  double last_pos_a_read_ms_;
+  double last_pos_b_read_ms_;
+  double last_vel_a_read_ms_;
+  double last_vel_b_read_ms_;
+  double last_read_math_ms_;
   uint32_t error_count_;
   double stack_pose_publish_hz_;
   bool stack_pose_sync_adaptive_;

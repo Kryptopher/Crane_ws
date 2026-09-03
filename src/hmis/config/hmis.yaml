@@ -1,0 +1,22 @@
+hmis:
+  ros__parameters:
+    # Identified payload mode. For a 2.0 s period, use 0.5 Hz.
+    natural_frequency_hz: 0.5
+    damping_ratio: 0.01
+    shaper_type: zvd
+
+    publish_rate_hz: 100.0
+    max_speed_mm_s: 60.0
+    max_acceleration_mm_s2: 150.0
+
+    # Logitech Dual Action convention used by this rig.
+    axis_x: 0
+    axis_y: 1
+    axis_sign_x: -1.0
+    axis_sign_y: 1.0
+    deadzone: 0.08
+    deadman_button: 4
+    estop_button: 5
+
+    joy_timeout_s: 0.25
+    state_timeout_s: 0.25

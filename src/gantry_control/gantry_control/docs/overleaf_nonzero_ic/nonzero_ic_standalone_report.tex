@@ -1,0 +1,33 @@
+\documentclass[3p]{elsarticle}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+
+\begin{document}
+
+\begin{frontmatter}
+\title{Adaptive Input Shaping from a Nonzero Initial Swing:\ Experimental Gantry-Crane Validation}
+\author{Sanjay}
+\begin{abstract}
+This report documents an adaptive, forward-only two-impulse input shaper for
+a gantry crane whose payload begins with a nonzero swing.  A five-second
+free-swing record identifies the finite-amplitude oscillation frequency.  An
+elliptic-integral correction maps that estimate to the small-angle frequency
+required by the linear schedule model, and the controller starts the complete
+velocity schedule at a predicted payload peak.  Two experiments beginning
+near an $18.5^{\circ}$ swing achieved approximately 95\% reduction of the
+fundamental swing amplitude during a $1100~\mathrm{mm}$ maneuver at
+$750~\mathrm{mm/s}$.
+\end{abstract}
+\begin{keyword}
+Input shaping \sep Gantry crane \sep Nonzero initial condition \sep Online identification \sep Finite-amplitude pendulum
+\end{keyword}
+\end{frontmatter}
+
+\section{Experimental validation}
+\input{nonzero_ic_experimental_section}
+
+\end{document}
+

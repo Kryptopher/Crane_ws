@@ -1,0 +1,21 @@
+# Stable names for the two identical CH340 USB-serial Arduinos on the crane.
+#
+# Both are QinHeng 1a86:7523 with no unique iSerial, so they can only be told
+# apart by which physical USB port they are plugged into. Keep each Arduino in
+# its labelled port.
+#
+#   1-2.1  ->  payload encoder Arduino Nano   ->  /dev/encoder_nano   (500000 baud)
+#   1-2.4  ->  IC-cart Arduino                ->  /dev/ic_cart        (115200 baud)
+#
+# Find the KERNELS path for a device with:
+#   udevadm info -a -n /dev/ttyCH341USB0 | grep -m1 'KERNELS=="1-'
+# and edit the values below if the ports differ on this machine.
+#
+# Install:
+#   sudo cp 99-crane-arduino-serial.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug/replug the two adapters (or reboot) and confirm:
+#   ls -l /dev/encoder_nano /dev/ic_cart
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", KERNELS=="1-2.1", SYMLINK+="encoder_nano", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", KERNELS=="1-2.4", SYMLINK+="ic_cart", MODE="0660", GROUP="dialout"

@@ -24,6 +24,7 @@ _DEFAULT_FIELDS = (
     'imu1_gx_dps', 'imu1_gy_dps', 'imu1_gz_dps',
     'imu2_gx_dps', 'imu2_gy_dps', 'imu2_gz_dps',
     'packet_age_ms', 'packet_seen', 'serial_lines', 'parse_errors', 'stale',
+    'wrap_events', 'sample_age_ms',
 )
 
 _OUTPUT_FIELDS = (
@@ -31,6 +32,7 @@ _OUTPUT_FIELDS = (
     'imu1_gx_dps', 'imu1_gy_dps', 'imu1_gz_dps',
     'imu2_gx_dps', 'imu2_gy_dps', 'imu2_gz_dps',
     'packet_age_ms', 'packet_seen', 'serial_lines', 'parse_errors', 'stale',
+    'wrap_events', 'sample_age_ms',
 )
 
 
@@ -68,8 +70,10 @@ class EncoderDiagnosticsLogger(Node):
                 label = msg.layout.dim[0].label
                 if label:
                     fields = label.split(',')
-            self._col_indices = [fields.index(name) for name in _OUTPUT_FIELDS]
-            self._writer.writerow(_OUTPUT_FIELDS)
+            # Tolerate a publisher that predates a field (e.g. wrap_events).
+            present = [name for name in _OUTPUT_FIELDS if name in fields]
+            self._col_indices = [fields.index(name) for name in present]
+            self._writer.writerow(present)
             self._header_written = True
 
         row: List[str] = [f'{msg.data[i]:.6f}' for i in self._col_indices]

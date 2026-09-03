@@ -1,19 +1,28 @@
 # Arduino Nano payload encoders over USB serial.
+#
+# The encoder Nano and the IC-cart Arduino are identical CH340 adapters
+# (1a86:7523, no unique serial), so ttyCH341USB0/USB1 can swap depending on
+# plug order. The node now content-verifies the stream and skips a wrong CH340,
+# but for deterministic naming install config/99-crane-arduino-serial.rules and
+# set serial_port to /dev/encoder_nano.
 
 encoder_serial_node:
   ros__parameters:
     serial_port: /dev/ttyCH341USB0
-    baud: 115200
+    baud: 500000
     publish_rate_hz: 100.0
     zero_on_start: true
 
-    # Nano firmware reports full 4x quadrature counts.
-    ppr: 1000
-    count_mode: 4
+    # 21-bit absolute magnetic encoders: 2^21 = 2097152 counts/rev
+    # (0.000172 deg/count).
+    counts_per_rev: 2097152
+    # The absolute reading wraps a full revolution at the firmware's sign
+    # boundary; unwrap it so pose_e/pose_e_rel stay continuous through a swing.
+    unwrap_counts: true
     invert_pitch: false
     invert_roll: false
 
-    rope_length_m: 1.00
+    rope_length_m: 0.90
     rel_vel_ema_alpha: 0.35
     rel_vel_min_dt_s: 0.003
     # Payload relative-frame mapping: pitch -> gantry X, roll -> gantry Y.

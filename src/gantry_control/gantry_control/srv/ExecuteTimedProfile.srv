@@ -1,0 +1,11 @@
+# Atomically arm a controller-owned staircase velocity profile.
+# start_time is an absolute ROS clock time. Profile knot times are relative to
+# that epoch and must begin at 0. The final velocity must be zero.
+builtin_interfaces/Time start_time
+float64[] time_s
+float64[] vx_mm_s
+float64[] vy_mm_s
+---
+bool success
+string message
+builtin_interfaces/Time accepted_start_time

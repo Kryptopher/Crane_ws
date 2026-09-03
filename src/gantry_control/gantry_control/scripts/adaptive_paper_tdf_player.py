@@ -16,8 +16,23 @@ stop-only adaptive player:
 
      with switches at T, 2T, tf, tf+T, tf+2T where tf = distance/vmax.
 
-The "robust" profile is a model-based ZVD baseline. It computes T and the
-three ZVD weights from a configured rope length and does not use online ID.
+The "robust" profile is a model-based ZVD baseline. The "zv" profile is the
+corresponding non-robust two-impulse ZV baseline. Both compute T and weights
+from a configured rope length and do not use online ID.
+
+The "nonzero-ic" profile observes a stationary-trolley free swing for ``tau``
+seconds, fits its frequency and instantaneous state, then uses the undamped
+closed-form two-impulse solution to cancel that measured initial state at the
+end of the move.  It holds zero until the fitted state permits a forward-only
+command.
+
+With ``--excite`` the "nonzero-ic" profile is preceded by a closed-loop
+swing-up stage (``nonzero_ic_exciter.NonzeroIcExciter``).  A resonant,
+amplitude-regulating trolley drive pumps the payload up to
+``--excite-target-angle-deg`` of axis swing (encoder angle), converging without
+overshoot and handing off at a swing extremum.  The ``tau`` free-swing
+identification window and the rest of the profile then run unchanged, timed
+from swing-up completion.
 """
 
 from __future__ import annotations
@@ -25,9 +40,12 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import subprocess
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -36,13 +54,23 @@ import sympy as sy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 
+from payload_perception_msgs.msg import PayloadState
 from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
 
 from gantry_control.msg import GantryState, TrajCmd
-from gantry_control.srv import SetMode
+from gantry_control.srv import ExecuteTimedProfile, SetMode
 
 from adaptive_id_player import AdaptiveIdentifier, Estimate
+from nonzero_ic_exciter import BoundedCycleExciter, BoundedExciteConfig
+from nonzero_ic_shaper import (
+    FreeSwingFrequencyEstimate,
+    RobustNonzeroIcShaper,
+    correct_finite_amplitude_frequency,
+    estimate_free_swing_frequency,
+    solve_nonzero_ic_shaper,
+    solve_robust_nonzero_ic_shaper,
+)
 
 
 @dataclass
@@ -61,20 +89,166 @@ class LockedSchedule:
     cond_b: float
 
 
+@dataclass
+class GantryStateSample:
+    rx_wall: float
+    stamp: float
+    x: float
+    y: float
+    vx: float
+    vy: float
+
+
+@dataclass(frozen=True)
+class TimedPayloadObservation:
+    """Payload sample nearest a controller-timed event in payload-clock time."""
+
+    sample_time_s: float
+    target_time_s: float
+    swing_mm: float
+    world_payload_velocity_mm_s: float
+
+    @property
+    def offset_ms(self) -> float:
+        return 1000.0 * (self.sample_time_s - self.target_time_s)
+
+
+def closer_timed_payload_observation(
+    current: TimedPayloadObservation | None,
+    *,
+    sample_time_s: float,
+    target_time_s: float,
+    swing_mm: float,
+    world_payload_velocity_mm_s: float,
+) -> TimedPayloadObservation:
+    """Keep the measurement closest to an event using the sensor time base."""
+    candidate = TimedPayloadObservation(
+        sample_time_s=float(sample_time_s),
+        target_time_s=float(target_time_s),
+        swing_mm=float(swing_mm),
+        world_payload_velocity_mm_s=float(world_payload_velocity_mm_s),
+    )
+    if current is None or abs(candidate.offset_ms) < abs(current.offset_ms):
+        return candidate
+    return current
+
+
+class NonzeroIcNotReady(ValueError):
+    """The live initial state has no forward-only two-impulse solution yet."""
+
+
+def scaled_nonzero_ic_frequency(
+    fitted_omega_rad_s: float,
+    scale: float,
+) -> float:
+    """Return the experimental shaper frequency without changing the ID fit."""
+    return float(fitted_omega_rad_s) * float(scale)
+
+
+def select_nonzero_ic_shaper_frequency(
+    fitted_omega_rad_s: float,
+    scale: float,
+    fixed_omega_rad_s: float,
+) -> float:
+    """Select an absolute experimental omega or a scaled fitted omega."""
+    if float(fixed_omega_rad_s) > 0.0:
+        return float(fixed_omega_rad_s)
+    return scaled_nonzero_ic_frequency(fitted_omega_rad_s, scale)
+
+
+def actuator_compensated_profile_start(
+    fitted_peak_wall: float,
+    actuation_lead_ms: float,
+) -> float:
+    """Issue the controller profile ahead of the fitted physical swing peak."""
+    return float(fitted_peak_wall) - 1.0e-3 * float(actuation_lead_ms)
+
+
+def update_payload_clock_calibration(
+    calibrated_offset_s: float | None,
+    previous_payload_time_s: float | None,
+    payload_time_s: float,
+    receive_wall_s: float,
+) -> tuple[float, float, bool]:
+    """Update the publisher-time to local-monotonic clock calibration.
+
+    ``receive_wall_s - payload_time_s`` contains the fixed clock offset plus
+    nonnegative ROS/executor queueing delay.  The minimum observed offset is
+    therefore the best online estimate of the clock mapping.  A large source
+    timestamp regression denotes an encoder-node clock reset and starts a new
+    calibration epoch.
+
+    Returns ``(clock_offset_s, queue_delay_s, clock_reset)``.
+    """
+    payload_time_s = float(payload_time_s)
+    receive_wall_s = float(receive_wall_s)
+    if not math.isfinite(payload_time_s) or not math.isfinite(receive_wall_s):
+        raise ValueError('payload and receive times must be finite')
+
+    clock_reset = (
+        previous_payload_time_s is not None
+        and math.isfinite(float(previous_payload_time_s))
+        and payload_time_s < float(previous_payload_time_s) - 1.0e-6
+    )
+    observed_offset_s = receive_wall_s - payload_time_s
+    if (
+        calibrated_offset_s is None
+        or not math.isfinite(float(calibrated_offset_s))
+        or clock_reset
+    ):
+        calibrated_offset_s = observed_offset_s
+    else:
+        calibrated_offset_s = min(
+            float(calibrated_offset_s), observed_offset_s)
+    queue_delay_s = max(0.0, observed_offset_s - calibrated_offset_s)
+    return float(calibrated_offset_s), float(queue_delay_s), clock_reset
+
+
+def payload_time_at_wall(
+    wall_time_s: float,
+    calibrated_offset_s: float,
+) -> float:
+    """Convert local monotonic time to the payload publisher's time base."""
+    return float(wall_time_s) - float(calibrated_offset_s)
+
+
+def payload_wall_at_time(
+    payload_time_s: float,
+    calibrated_offset_s: float,
+) -> float:
+    """Convert payload publisher time to calibrated local monotonic time."""
+    return float(payload_time_s) + float(calibrated_offset_s)
+
+
 class AdaptivePaperTdfPlayer(Node):
     def __init__(self, args):
         super().__init__('adaptive_paper_tdf_player')
         self.args = args
 
         self.latest_gantry_state: GantryState | None = None
+        self.latest_gantry_state_sample: GantryStateSample | None = None
+        self.latest_cart_state_sample: GantryStateSample | None = None
+        self.gantry_state_samples: list[GantryStateSample] = []
         self.latest_payload_abs_mm: float | None = None
         self.latest_swing_mm: float | None = None
         self.latest_payload_rel_x_mm: float | None = None
         self.latest_payload_rel_y_mm: float | None = None
         self.latest_payload_rel_z_mm: float | None = None
+        self.latest_payload_rel_vx_mm_s: float | None = None
+        self.latest_payload_rel_vy_mm_s: float | None = None
+        self.latest_payload_rel_raw_vx_mm_s: float | None = None
+        self.latest_payload_rel_raw_vy_mm_s: float | None = None
+        self.latest_payload_encoder_sample_age_ms: float | None = None
         self.latest_cart_q_mm: float | None = None
+        self.latest_cam_gantry_x_mm: float | None = None
+        self.latest_cam_gantry_y_mm: float | None = None
         self.latest_payload_time: float | None = None
         self.latest_payload_wall: float | None = None
+        self.payload_clock_offset_s: float | None = None
+        self.latest_payload_observed_clock_offset_s: float | None = None
+        self.latest_payload_queue_delay_ms: float | None = None
+        self.latest_traj_latency: list[float] | None = None
+        self.latest_traj_latency_wall: float | None = None
         self.latest_id_filtered_swing_mm: float | None = None
         self._id_filter_time: float | None = None
 
@@ -91,7 +265,12 @@ class AdaptivePaperTdfPlayer(Node):
         self.id_report_estimates: list[Estimate] = []
         self.best_estimate: Estimate | None = None
         self.mode_fit_samples: list[tuple[float, float]] = []
-        self.latest_mode_fit_estimate: Estimate | None = None
+        self.zero_zeta_samples: list[tuple[float, float]] = []
+        self.latest_zero_zeta_estimate: Estimate | None = None
+        self.latest_zero_zeta_score: float | None = None
+        self.latest_zero_zeta_rmse: float | None = None
+        self.latest_zero_zeta_amp: float | None = None
+        self.latest_freq_bank_estimate: Estimate | None = None
         self.latest_paper2_estimate: Estimate | None = None
         self.latest_two_mode_estimate: Estimate | None = None
         self.latest_two_mode_t2: float | None = None
@@ -100,21 +279,115 @@ class AdaptivePaperTdfPlayer(Node):
         self.latest_two_mode_amp_ratio: float | None = None
         self.latest_two_mode_nrmse: float | None = None
         self._last_mode_fit_log_t = -1.0
+        self._last_zero_zeta_update_t = -1.0
+        self._zero_zeta_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix='zero-zeta-id')
+            if args.id_method == 'zero-zeta-ls'
+            else None
+        )
+        self._zero_zeta_future: Future | None = None
+        self._last_freq_bank_update_t = -1.0
         self._last_two_mode_update_t = -1.0
         self.residual_samples: list[tuple[float, float]] = []
         self.csv_file = None
         self.csv_writer: csv.writer | None = None
+        self.csv_path: Path | None = None
+        self.run_outputs_generated = False
         self._log_flush_count = 0
         self._last_wait_ready_print = 0.0
         self._last_id_status_print = 0.0
+        self._auto_start_ready_wall: float | None = None
+        self._last_nonzero_ic_wait_log_wall = -math.inf
+        self._last_nonzero_ic_wait_reason = ''
+        self._id_updates_stopped_logged = False
         self._missed_first_switch_warned = False
+        self._last_stream_wall: float | None = None
+        self.latest_stream_dt_ms: float | None = None
+        self.latest_payload_age_ms: float | None = None
+        self.latest_gantry_state_age_ms: float | None = None
+        self.nonzero_ic_initial_swing_mm: float | None = None
+        self.nonzero_ic_initial_payload_velocity_mm_s: float | None = None
+        self.nonzero_ic_predicted_peak_swing_mm: float | None = None
+        self.nonzero_ic_predicted_peak_payload_velocity_mm_s: float | None = None
+        self.nonzero_ic_predicted_command_start_swing_mm: float | None = None
+        self.nonzero_ic_predicted_command_start_payload_velocity_mm_s: float | None = None
+        self.nonzero_ic_fitted_omega_rad_s: float | None = None
+        self.nonzero_ic_small_angle_omega_rad_s: float | None = None
+        self.nonzero_ic_fitted_amplitude_angle_deg: float | None = None
+        self.nonzero_ic_frequency_correction_factor: float | None = None
+        self.nonzero_ic_used_omega_rad_s: float | None = None
+        self.nonzero_ic_robust_solution: RobustNonzeroIcShaper | None = None
+        self.nonzero_ic_profile_events: tuple[tuple[float, float], ...] | None = None
+        self.nonzero_ic_swing_samples: list[tuple[float, float]] = []
+        self.nonzero_ic_frequency_estimate: FreeSwingFrequencyEstimate | None = None
+        self._nonzero_ic_fit_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix='nonzero-ic-id')
+            if args.profile == 'nonzero-ic' and args.nonzero_ic_adaptive_frequency
+            else None
+        )
+        self._nonzero_ic_fit_future: Future | None = None
+        self._last_nonzero_ic_fit_wall = -math.inf
+        self._last_nonzero_ic_fit_log_wall = -math.inf
+        self._last_nonzero_ic_fit_error = 'frequency fit has not run yet'
+        self.timed_profile_future: Future | None = None
+        self.timed_profile_start_wall: float | None = None
+        self.timed_profile_peak_wall: float | None = None
+        self.timed_profile_start_payload_time: float | None = None
+        self.timed_profile_peak_payload_time: float | None = None
+        self.timed_profile_payload_clock_offset_s: float | None = None
+        self.timed_profile_arm_payload_queue_delay_ms: float | None = None
+        self.nonzero_ic_measured_command_start: TimedPayloadObservation | None = None
+        self.nonzero_ic_measured_peak: TimedPayloadObservation | None = None
+        self.timed_profile_request_wall: float | None = None
+        self.controller_timed_profile_active = False
+
+        # Closed-loop swing-up (``--excite``) state.  ``phase`` tracks the
+        # nonzero-IC state machine: wait_telemetry -> excite -> id_hold ->
+        # wait_peak -> arm_profile -> armed_profile -> maneuver -> residual.
+        # Profiles without ``--excite`` and non-nonzero-ic profiles skip the
+        # excitation/ID phases as appropriate.
+        self.phase = 'wait_telemetry'
+        self.run_start_wall: float | None = None
+        self.id_hold_start_wall: float | None = None
+        self.excite_start_cart_q_mm: float | None = None
+        self.excite_angle_bias_deg = 0.0
+        self.latest_enc_wall: float | None = None
+        self.latest_enc_diag_wall: float | None = None
+        self._latest_excite_cmd = None
+        self.excite_only_complete = False
+        self._last_excite_wait_log_wall = -math.inf
+        self.exciter: BoundedCycleExciter | None = None
+        if args.profile == 'nonzero-ic' and args.excite:
+            excite_omega = (
+                args.excite_omega_rad_s
+                if args.excite_omega_rad_s > 0.0
+                else math.sqrt(args.gravity_m_s2 / args.robust_rope_length_m)
+            )
+            self.exciter = BoundedCycleExciter(BoundedExciteConfig(
+                target_angle_deg=args.excite_target_angle_deg,
+                omega_rad_s=excite_omega,
+                tolerance_deg=args.excite_angle_tolerance_deg,
+                speed_mm_s=args.excite_speed_mm_s,
+                initial_excursion_mm=args.excite_initial_excursion_mm,
+                excursion_step_mm=args.excite_excursion_step_mm,
+                max_excursion_mm=args.excite_travel_budget_mm,
+                position_kp_s=args.excite_position_kp_s,
+                return_speed_mm_s=args.excite_return_speed_mm_s,
+                return_tolerance_mm=args.excite_return_tolerance_mm,
+                settle_cycles=args.excite_settle_cycles,
+                timeout_s=args.excite_timeout_s,
+                abort_angle_deg=args.excite_abort_angle_deg,
+                slew_mm_s2=args.excite_slew_mm_s2,
+            ))
 
         # Encoder debug logging. These come from:
         #   /payload/pose_e:
         #     [time, pitch_deg, roll_deg, pitch_count, roll_count]
         #   /payload/encoder/diagnostics:
         #     [time, arduino_ms, pitch_raw, roll_raw, pitch_count, roll_count,
-        #      serial_lines, parse_errors, stale]
+        #      imu1_ax, imu1_ay, imu1_az, imu1_gx, imu1_gy, imu1_gz,
+        #      imu2_ax, imu2_ay, imu2_az, imu2_gx, imu2_gy, imu2_gz,
+        #      optional packet_age_ms, packet_seen, serial_lines, parse_errors, stale]
         self.latest_enc_pitch_deg = None
         self.latest_enc_roll_deg = None
         self.latest_enc_pitch_count = None
@@ -123,6 +396,20 @@ class AdaptivePaperTdfPlayer(Node):
         self.latest_enc_arduino_ms = None
         self.latest_enc_pitch_raw = None
         self.latest_enc_roll_raw = None
+        self.latest_enc_imu1_ax = None
+        self.latest_enc_imu1_ay = None
+        self.latest_enc_imu1_az = None
+        self.latest_enc_imu1_gx = None
+        self.latest_enc_imu1_gy = None
+        self.latest_enc_imu1_gz = None
+        self.latest_enc_imu2_ax = None
+        self.latest_enc_imu2_ay = None
+        self.latest_enc_imu2_az = None
+        self.latest_enc_imu2_gx = None
+        self.latest_enc_imu2_gy = None
+        self.latest_enc_imu2_gz = None
+        self.latest_enc_packet_age_ms = None
+        self.latest_enc_packet_seen = None
         self.latest_enc_serial_lines = None
         self.latest_enc_parse_errors = None
         self.latest_enc_stale = None
@@ -131,8 +418,8 @@ class AdaptivePaperTdfPlayer(Node):
         self.vmax_abs_mm_s = abs(float(args.vmax_mm_s))
         self.tf = args.target_distance_mm / self.vmax_abs_mm_s
         self.initial_velocity_mm_s = self.direction * args.a0 * self.vmax_abs_mm_s
-        if args.profile == 'robust':
-            self._configure_robust_schedule()
+        if args.profile in ('robust', 'zv'):
+            self._configure_model_schedule()
 
         self.identifier = AdaptiveIdentifier(
             K_mm_s=self.initial_velocity_mm_s,
@@ -144,6 +431,7 @@ class AdaptivePaperTdfPlayer(Node):
             zeta_max=args.id_zeta_max,
             lowpass_hz=0.0,
             local_window_s=args.integral_id_window_s,
+            assume_zero_zeta=args.id_assume_zero_zeta,
         )
 
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
@@ -151,6 +439,8 @@ class AdaptivePaperTdfPlayer(Node):
         self.estimate_pub = self.create_publisher(Float64MultiArray, args.estimate_topic, 10)
         self.enable_cli = self.create_client(Trigger, '/gantry/enable')
         self.mode_cli = self.create_client(SetMode, '/gantry/set_mode')
+        self.timed_profile_cli = self.create_client(
+            ExecuteTimedProfile, '/gantry/execute_timed_profile')
 
         self.create_subscription(GantryState, '/gantry/state', self._gantry_state_cb, 10)
         self.create_subscription(TrajCmd, '/traj_cmd', self._traj_cmd_cb, qos)
@@ -161,6 +451,12 @@ class AdaptivePaperTdfPlayer(Node):
         self.create_subscription(
             Float64MultiArray, '/payload/encoder/diagnostics',
             self._encoder_diag_cb, qos_profile_sensor_data)
+        self.create_subscription(
+            Float64MultiArray, '/gantry/traj_latency',
+            self._traj_latency_cb, qos_profile_sensor_data)
+        self.create_subscription(
+            PayloadState, '/payload/state',
+            self._payload_state_cb, qos_profile_sensor_data)
 
         if args.log_csv:
             self._open_csv_log(args.log_csv)
@@ -171,10 +467,20 @@ class AdaptivePaperTdfPlayer(Node):
         self.start_timer = self.create_timer(0.5, self._start_timer_cb)
 
         self.get_logger().info('adaptive_paper_tdf_player started')
+        initial_command = (
+            'deferred until MOTION_START'
+            if args.profile == 'nonzero-ic'
+            else f'{self.initial_velocity_mm_s:.1f} mm/s'
+        )
+        amplitude_summary = (
+            'A0/A1=deferred'
+            if args.profile == 'nonzero-ic'
+            else f'A0={args.a0:.3f}'
+        )
         self.get_logger().info(
             f'Profile={args.profile} axis={args.axis} target={args.target_distance_mm:.1f} mm '
-            f'vmax={args.vmax_mm_s:.1f} mm/s A0={args.a0:.3f} '
-            f'initial_v={self.initial_velocity_mm_s:.1f} mm/s tf={self.tf:.3f}s')
+            f'vmax={args.vmax_mm_s:.1f} mm/s {amplitude_summary} '
+            f'initial_command={initial_command} tf={self.tf:.3f}s')
         if args.profile in (
             'adaptive',
             'colleague-moving',
@@ -194,6 +500,8 @@ class AdaptivePaperTdfPlayer(Node):
                 self.get_logger().info(
                     f'Integral ID local window enabled: {args.integral_id_window_s:.3f}s '
                     'with fitted local initial velocity')
+            if args.id_assume_zero_zeta:
+                self.get_logger().info('Integral ID zero-zeta assumption enabled')
             if args.id_lowpass_hz > 0.0:
                 self.get_logger().info(
                     f'ID swing low-pass enabled: cutoff={args.id_lowpass_hz:.2f} Hz')
@@ -233,31 +541,147 @@ class AdaptivePaperTdfPlayer(Node):
                 self.get_logger().info(
                     f'{args.profile} IS: tau={args.tau:.3f}s, initial speed K*vmax, '
                     'then switches at tau+T, tau+2T, tf, tf+tau+T, tf+tau+2T')
-        elif args.profile == 'robust':
+        elif args.profile in ('robust', 'zv'):
             sched = self.schedule
             if sched is not None:
                 omega = math.sqrt(args.gravity_m_s2 / args.robust_rope_length_m)
+                label = 'Robust ZVD' if args.profile == 'robust' else 'Non-robust ZV'
                 self.get_logger().info(
-                    f'Robust ZVD baseline: L={args.robust_rope_length_m:.3f}m '
+                    f'{label} baseline: L={args.robust_rope_length_m:.3f}m '
                     f'omega_n={omega:.4f}rad/s T={sched.T:.4f}s '
                     f'A=[{sched.A0:.4f},{sched.A1:.4f},{sched.A2:.4f}]')
+        elif args.profile == 'nonzero-ic':
+            if args.nonzero_ic_adaptive_frequency:
+                frequency_source = (
+                    'adaptive free-swing fit over '
+                    f'tau={args.tau:.1f}s in '
+                    f'[{args.nonzero_ic_omega_min_rad_s:.3f}, '
+                    f'{args.nonzero_ic_omega_max_rad_s:.3f}]rad/s'
+                )
+            else:
+                omega = (
+                    args.nonzero_ic_omega_rad_s
+                    if args.nonzero_ic_omega_rad_s > 0.0
+                    else math.sqrt(
+                        args.gravity_m_s2 / args.robust_rope_length_m
+                    )
+                )
+                frequency_source = f'fixed omega_n={omega:.4f}rad/s'
+            state_source = (
+                'CLI overrides'
+                if (
+                    args.initial_swing_mm is not None
+                    and args.initial_payload_velocity_mm_s is not None
+                )
+                else 'live payload/cart measurements (with any supplied overrides)'
+            )
+            self.get_logger().info(
+                f'Nonzero-IC {"robust specified-insensitivity" if args.nonzero_ic_robust else "two-impulse"} '
+                f'profile: {frequency_source}; '
+                f'initial state source={state_source}. Schedule is solved and '
+                'terminal-verified immediately before the first command. TRAJ '
+                f'activation waits tau={args.tau:.1f}s after '
+                'telemetry is ready, then holds zero until both gains are '
+                'forward-only.'
+                + (
+                    ' Start is phase-locked to the positive swing peak in the '
+                    'direction of travel with '
+                    f'|payload_v| <= '
+                    f'{args.nonzero_ic_peak_velocity_tolerance_mm_s:.1f}mm/s.'
+                    if args.nonzero_ic_start_at_peak
+                    else ''
+                ))
+            if args.nonzero_ic_robust:
+                self.get_logger().info(
+                    'Robust nonzero-IC optimization enabled: exact nominal '
+                    'terminal cancellation, positive acceleration/deceleration '
+                    'increments, exact travel, and minimized residual over '
+                    f'+/-{100.0 * args.nonzero_ic_robust_band_fraction:.1f}% '
+                    'frequency uncertainty.')
+            if args.controller_timed_profile:
+                self.get_logger().info(
+                    'Switch timing: controller-owned atomic profile; next '
+                    'travel-direction peak is predicted with at least '
+                    f'{args.timed_profile_lead_s:.3f}s service lead; commands '
+                    f'are advanced {args.timed_profile_actuation_lead_ms:.1f}ms '
+                    'relative to the fitted physical peak using the '
+                    'equivalent-pure-delay actuator model. Predicted and '
+                    'nearest measured command/peak states are logged '
+                    'separately. Payload-clock mapping uses the minimum '
+                    'observed publisher-to-callback offset and arming waits '
+                    'for queue delay <= '
+                    f'{args.nonzero_ic_max_payload_queue_delay_ms:.1f}ms.')
+            if not math.isclose(
+                args.nonzero_ic_shaper_frequency_scale,
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            ):
+                self.get_logger().info(
+                    'Experimental nonzero-IC shaper frequency scale: '
+                    f'{args.nonzero_ic_shaper_frequency_scale:.6f}; fitted '
+                    'frequency remains unchanged for phase/peak prediction.')
+            if args.nonzero_ic_shaper_omega_rad_s > 0.0:
+                self.get_logger().info(
+                    'Experimental fixed nonzero-IC shaper frequency: '
+                    f'{args.nonzero_ic_shaper_omega_rad_s:.6f}rad/s; the '
+                    'adaptive fit remains active only for state and future-peak '
+                    'prediction.')
+            if args.nonzero_ic_finite_amplitude_correction:
+                self.get_logger().info(
+                    'Finite-amplitude frequency correction enabled: the '
+                    'sinusoidal fit remains the phase/peak model, while the '
+                    'closed-form solver uses the exact simple-pendulum '
+                    'small-angle frequency inferred with '
+                    f'L={args.robust_rope_length_m:.4f}m.')
+            if args.excite and self.exciter is not None:
+                self.get_logger().info(
+                    'Excite stage enabled: closed-loop swing-up to '
+                    f'{args.excite_target_angle_deg:.1f}deg axis swing '
+                    f'(omega_n={self.exciter.cfg.omega_rad_s:.4f}rad/s, '
+                    f'speed={args.excite_speed_mm_s:.0f}mm/s, '
+                    f'tol={args.excite_angle_tolerance_deg:.1f}deg). The '
+                    f'tau={args.tau:.1f}s free-swing ID window starts when '
+                    'swing-up converges.')
         else:
-            self.get_logger().info('Pulse baseline: command vmax until tf, then zero.')
+            self.get_logger().info(
+                'Pulse baseline: '
+                f'hold zero for {args.pulse_pre_delay_s:.3f}s, command vmax '
+                f'for tf={self.tf:.3f}s, then zero.')
 
     def destroy_node(self):
         try:
             if rclpy.ok():
-                self._publish_stream(0.0, 0.0)
+                if (
+                    self.controller_timed_profile_active
+                    or self.timed_profile_start_wall is not None
+                ):
+                    self._publish_traj_abort()
+                else:
+                    self._publish_stream(0.0, 0.0)
         except Exception:
             pass
         if self.csv_file is not None:
+            try:
+                self.csv_file.flush()
+                self._generate_run_outputs()
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'Automatic run output generation failed during shutdown: {exc}')
             self.csv_file.close()
             self.csv_file = None
+        if self._zero_zeta_executor is not None:
+            self._zero_zeta_executor.shutdown(wait=True, cancel_futures=True)
+            self._zero_zeta_executor = None
+        if self._nonzero_ic_fit_executor is not None:
+            self._nonzero_ic_fit_executor.shutdown(wait=True, cancel_futures=True)
+            self._nonzero_ic_fit_executor = None
         super().destroy_node()
 
     def _open_csv_log(self, path_arg: str):
         path = Path(path_arg).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_path = path.resolve()
         self.csv_file = path.open('w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
@@ -267,11 +691,60 @@ class AdaptivePaperTdfPlayer(Node):
             'cmd_vy_mm_s',
             'payload_abs_mm',
             'swing_mm',
+            'swing_pitch_deg',
+            'swing_roll_deg',
+            'swing_axis_angle_deg',
             'id_filtered_swing_mm',
             'cart_q_mm',
+            'cart_vx_mm_s',
+            'cart_vy_mm_s',
+            'gantry_state_stamp_s',
+            'gantry_state_age_ms',
+            'payload_sample_time_s',
+            'payload_wall_age_ms',
+            'payload_observed_clock_offset_s',
+            'payload_calibrated_clock_offset_s',
+            'payload_queue_delay_ms',
+            'payload_encoder_sample_age_ms',
+            'payload_rel_vx_filtered_mm_s',
+            'payload_rel_vx_raw_mm_s',
+            'stream_dt_ms',
             'traveled_mm',
             'cond_b',
             'omega_n_rad_s',
+            'nonzero_ic_fitted_omega_rad_s',
+            'nonzero_ic_small_angle_omega_rad_s',
+            'nonzero_ic_fitted_amplitude_angle_deg',
+            'nonzero_ic_frequency_correction_factor',
+            'nonzero_ic_shaper_omega_rad_s',
+            'nonzero_ic_shaper_frequency_scale',
+            'nonzero_ic_shaper_frequency_mode',
+            'nonzero_ic_configured_shaper_omega_rad_s',
+            'nonzero_ic_robust_enabled',
+            'nonzero_ic_robust_band_fraction',
+            'nonzero_ic_robust_impulse_times_s',
+            'nonzero_ic_robust_start_amplitudes',
+            'nonzero_ic_robust_stop_amplitudes',
+            'nonzero_ic_robust_worst_residual_fraction',
+            'nonzero_ic_two_impulse_worst_residual_fraction',
+            'nonzero_ic_robust_optimizer_iterations',
+            'timed_profile_actuation_lead_ms',
+            'timed_profile_fitted_peak_wall_s',
+            'timed_profile_start_wall_s',
+            'timed_profile_fitted_peak_payload_time_s',
+            'timed_profile_start_payload_time_s',
+            'timed_profile_payload_clock_offset_s',
+            'timed_profile_arm_payload_queue_delay_ms',
+            'nonzero_ic_predicted_peak_swing_mm',
+            'nonzero_ic_predicted_peak_payload_velocity_mm_s',
+            'nonzero_ic_predicted_command_start_swing_mm',
+            'nonzero_ic_predicted_command_start_payload_velocity_mm_s',
+            'nonzero_ic_measured_command_start_swing_mm',
+            'nonzero_ic_measured_command_start_payload_velocity_mm_s',
+            'nonzero_ic_measured_command_start_sample_offset_ms',
+            'nonzero_ic_measured_peak_swing_mm',
+            'nonzero_ic_measured_peak_payload_velocity_mm_s',
+            'nonzero_ic_measured_peak_sample_offset_ms',
             'id_zeta',
             'T_sec',
             'A0',
@@ -282,6 +755,13 @@ class AdaptivePaperTdfPlayer(Node):
             'schedule_id_time_s',
             'schedule_id_T_sec',
             'schedule_T_sec',
+            'nonzero_ic_initial_swing_mm',
+            'nonzero_ic_initial_payload_velocity_mm_s',
+            'nonzero_ic_fit_amplitude_mm',
+            'nonzero_ic_fit_rmse_mm',
+            'nonzero_ic_fit_nrmse',
+            'nonzero_ic_fit_samples',
+            'nonzero_ic_fit_window_s',
             'id_candidate_time_s',
             'id_candidate_cond_b',
             'id_candidate_omega_n_rad_s',
@@ -289,13 +769,19 @@ class AdaptivePaperTdfPlayer(Node):
             'id_candidate_T_sec',
             'id_candidate_valid',
             'id_candidate_reject_reason',
+            'eq21_input_model',
+            'zero_zeta_T_sec',
+            'zero_zeta_score',
+            'zero_zeta_rmse',
+            'zero_zeta_amp_mm',
+            'final_id_source',
+            'id_duration_s',
+            'id_speed_mm_s',
             'two_mode_T2_sec',
             'two_mode_amp1_mm',
             'two_mode_amp2_mm',
             'two_mode_amp2_amp1',
             'two_mode_norm_rmse',
-            'enc_pitch_deg',
-            'enc_roll_deg',
             'enc_pitch_count',
             'enc_roll_count',
             'enc_x_rel_mm',
@@ -304,12 +790,106 @@ class AdaptivePaperTdfPlayer(Node):
             'enc_arduino_ms',
             'enc_pitch_raw',
             'enc_roll_raw',
+            'enc_imu1_ax',
+            'enc_imu1_ay',
+            'enc_imu1_az',
+            'enc_imu1_gx',
+            'enc_imu1_gy',
+            'enc_imu1_gz',
+            'enc_imu2_ax',
+            'enc_imu2_ay',
+            'enc_imu2_az',
+            'enc_imu2_gx',
+            'enc_imu2_gy',
+            'enc_imu2_gz',
+            'enc_packet_age_ms',
+            'enc_packet_seen',
             'enc_serial_lines',
             'enc_parse_errors',
             'enc_stale',
+            'swing_cam_x_abs',
+            'swing_cam_x_rel',
+            'swing_cam_y_abs',
+            'swing_cam_y_rel',
+            'lat_state_stamp_s',
+            'lat_encoder_read_stamp_s',
+            'lat_stream_seq_rx',
+            'lat_stream_seq_applied',
+            'lat_source_stamp_s',
+            'lat_controller_rx_stamp_s',
+            'lat_apply_begin_stamp_s',
+            'lat_apply_done_stamp_s',
+            'lat_received_vx_mm_s',
+            'lat_received_vy_mm_s',
+            'lat_applied_vx_mm_s',
+            'lat_applied_vy_mm_s',
+            'lat_cart_x_mm',
+            'lat_cart_y_mm',
+            'lat_selected_vx_mm_s',
+            'lat_selected_vy_mm_s',
+            'lat_motor_vx_mm_s',
+            'lat_motor_vy_mm_s',
+            'lat_position_vx_mm_s',
+            'lat_position_vy_mm_s',
+            'lat_motor_a_position_rad',
+            'lat_motor_b_position_rad',
+            'lat_motor_a_velocity_rad_s',
+            'lat_motor_b_velocity_rad_s',
+            'lat_read_time_ms',
+            'lat_write_time_ms',
+            'lat_diagnostic_age_ms',
+            'phase',
+            'run_time_sec',
+            'excite_angle_deg',
+            'excite_angle_bias_deg',
+            'excite_amplitude_est_deg',
+            'excite_peak_est_deg',
+            'excite_angle_rate_deg_s',
+            'excite_cmd_vx_mm_s',
+            'excite_drive_sign',
+            'excite_cart_offset_mm',
+            'excite_omega_rad_s',
         ])
         self.csv_file.flush()
         self.get_logger().info(f'CSV log: {path}')
+
+    def _generate_run_outputs(self) -> None:
+        if (
+            self.run_outputs_generated
+            or not self.args.auto_plot
+            or self.csv_path is None
+        ):
+            return
+        self.run_outputs_generated = True
+        plotter = Path(__file__).resolve().with_name(
+            'plot_adaptive_paper_run.py')
+        if not plotter.exists():
+            self.get_logger().warn(
+                f'Automatic plotter is unavailable: {plotter}')
+            return
+        try:
+            result = subprocess.run(
+                [sys.executable, str(plotter), str(self.csv_path)],
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                check=False,
+            )
+        except Exception as exc:
+            self.get_logger().warn(f'Automatic plot generation failed: {exc}')
+            return
+        output_text = ' | '.join(
+            line.strip()
+            for line in (result.stdout + '\n' + result.stderr).splitlines()
+            if line.strip()
+        )
+        if result.returncode == 0:
+            self.get_logger().info(
+                f'Automatic run outputs complete: {output_text}')
+        else:
+            self.get_logger().warn(
+                f'Automatic run outputs failed ({result.returncode}): '
+                f'{output_text}')
 
     def _arm_traj_mode(self):
         if not self.mode_cli.wait_for_service(timeout_sec=5.0):
@@ -327,11 +907,40 @@ class AdaptivePaperTdfPlayer(Node):
 
     def _start_timer_cb(self):
         if not self._preflight_ready():
+            self._auto_start_ready_wall = None
             now = time.monotonic()
             if now - self._last_wait_ready_print > 1.0:
                 self._last_wait_ready_print = now
                 self.get_logger().info(
                     'Waiting for fresh /payload/pose_e_rel and /gantry/state before start')
+            return
+
+        now = time.monotonic()
+        if self.args.profile != 'nonzero-ic':
+            start_delay_s = 0.0
+        elif self.args.excite:
+            # With --excite the trolley itself pumps the payload, so STREAM must
+            # be live; the tau window instead follows swing-up completion.
+            start_delay_s = self.args.excite_standclear_s
+        else:
+            start_delay_s = self.args.tau
+        activation_label = (
+            'closed-loop swing-up begins'
+            if self.args.profile == 'nonzero-ic' and self.args.excite
+            else 'Nonzero-IC TRAJ activates'
+        )
+        if self._auto_start_ready_wall is None:
+            self._auto_start_ready_wall = now
+            if start_delay_s > 0.0:
+                self.get_logger().info(
+                    f'Telemetry ready. {activation_label} in '
+                    f'{start_delay_s:.1f}s; prepare the payload and stand clear.')
+        remaining_s = start_delay_s - (now - self._auto_start_ready_wall)
+        if remaining_s > 0.0:
+            if now - self._last_wait_ready_print > 0.9:
+                self._last_wait_ready_print = now
+                self.get_logger().info(
+                    f'{activation_label} in {remaining_s:.1f}s')
             return
 
         try:
@@ -351,11 +960,46 @@ class AdaptivePaperTdfPlayer(Node):
         self.get_logger().info('Requested /gantry/enable to start TRAJ realtime STREAM')
 
     def _preflight_ready(self) -> bool:
-        if self.latest_gantry_state is None:
+        now = time.monotonic()
+        if (
+            self.latest_gantry_state_sample is None
+            or now - self.latest_gantry_state_sample.rx_wall
+            > self.args.gantry_fresh_timeout
+        ):
             return False
         if self.latest_payload_abs_mm is None or self.latest_payload_wall is None:
             return False
-        return time.monotonic() - self.latest_payload_wall <= self.args.payload_fresh_timeout
+        if now - self.latest_payload_wall > self.args.payload_fresh_timeout:
+            return False
+        if (
+            self.args.profile == 'nonzero-ic'
+            and self.args.require_encoder_health
+            and not self._encoder_health_ready(now)
+        ):
+            return False
+        if self.args.profile == 'nonzero-ic' and self.args.excite:
+            angle = self._excite_axis_angle_deg()
+            if angle is None or not math.isfinite(angle):
+                return False
+            if (
+                self.latest_enc_wall is None
+                or now - self.latest_enc_wall
+                > self.args.payload_fresh_timeout
+            ):
+                return False
+        if (
+            self.args.profile == 'nonzero-ic'
+            and not self.args.nonzero_ic_adaptive_frequency
+            and self.args.initial_payload_velocity_mm_s is None
+        ):
+            relative_velocity = (
+                self.latest_payload_rel_vx_mm_s
+                if self.args.axis == 'x'
+                else self.latest_payload_rel_vy_mm_s
+            )
+            if relative_velocity is None or not math.isfinite(relative_velocity):
+                return False
+        return True
 
     def _on_enable_done(self, future):
         try:
@@ -366,15 +1010,89 @@ class AdaptivePaperTdfPlayer(Node):
         if result is not None:
             self.get_logger().info(f'/gantry/enable: {result.message}')
 
+    def _msg_stamp_sec(self, msg: GantryState) -> float:
+        stamp = msg.header.stamp
+        return float(stamp.sec) + 1.0e-9 * float(stamp.nanosec)
+
     def _gantry_state_cb(self, msg: GantryState):
         self.latest_gantry_state = msg
+        rx_wall = time.monotonic()
+        sample = GantryStateSample(
+            rx_wall=rx_wall,
+            stamp=self._msg_stamp_sec(msg),
+            x=float(msg.x),
+            y=float(msg.y),
+            vx=float(msg.vx),
+            vy=float(msg.vy),
+        )
+        self.latest_gantry_state_sample = sample
+        self.gantry_state_samples.append(sample)
+        cutoff = rx_wall - 2.0
+        self.gantry_state_samples = [
+            old for old in self.gantry_state_samples if old.rx_wall >= cutoff
+        ]
+
+    def _cart_state_for_wall_time(self, wall_t: float) -> GantryStateSample | None:
+        samples = self.gantry_state_samples
+        if not samples:
+            return None
+        if wall_t <= samples[0].rx_wall:
+            return samples[0]
+        if wall_t >= samples[-1].rx_wall:
+            return samples[-1]
+        for prev, nxt in zip(samples[:-1], samples[1:]):
+            if prev.rx_wall <= wall_t <= nxt.rx_wall:
+                dt = nxt.rx_wall - prev.rx_wall
+                if dt <= 1.0e-9:
+                    return nxt
+                a = (wall_t - prev.rx_wall) / dt
+                return GantryStateSample(
+                    rx_wall=wall_t,
+                    stamp=prev.stamp + a * (nxt.stamp - prev.stamp),
+                    x=prev.x + a * (nxt.x - prev.x),
+                    y=prev.y + a * (nxt.y - prev.y),
+                    vx=prev.vx + a * (nxt.vx - prev.vx),
+                    vy=prev.vy + a * (nxt.vy - prev.vy),
+                )
+        return samples[-1]
 
     def _traj_cmd_cb(self, msg: TrajCmd):
         if msg.command != TrajCmd.MOTION_START or self.motion_started:
             return
         self.motion_started = True
+        self.run_start_wall = time.monotonic()
+        if self.args.profile == 'nonzero-ic':
+            # The TRAJ controller is active, but keep streaming zero until the
+            # freely swinging payload reaches a state whose closed-form
+            # solution has 0 <= A0,A1 <= 1.  Profile time begins only when that
+            # state is captured, so no reverse command is ever needed.
+            self.wall_start = None
+            self.schedule = None
+            if self.args.excite and self.exciter is not None:
+                self.phase = 'excite'
+                self.excite_start_cart_q_mm = self.latest_cart_q_mm
+                # The bounded-cycle controller estimates amplitude from each
+                # cycle's peak-to-peak angle.  Do not reinterpret the first
+                # instantaneous sample as vertical; the previous hardware run
+                # began at +3.63 deg and that false bias destabilized feedback.
+                self.excite_angle_bias_deg = 0.0
+                self.get_logger().info(
+                    'MOTION_START received; beginning bounded positive-axis '
+                    f'swing-up to {self.args.excite_target_angle_deg:.1f}deg; '
+                    f'anchor={self.excite_start_cart_q_mm:.1f}mm.')
+            else:
+                self.phase = 'wait_peak'
+                self.get_logger().info(
+                    'MOTION_START received; holding the trolley at zero velocity '
+                    'until a forward-only nonzero-IC solution is available')
+            return
+        self.phase = 'maneuver'
         self.wall_start = time.monotonic()
-        if self.latest_payload_abs_mm is not None and self.latest_payload_time is not None:
+        if (
+            self.args.profile != 'nonzero-ic'
+            and self.latest_payload_abs_mm is not None
+            and self.latest_payload_time is not None
+        ):
             self._begin_id()
         self.get_logger().info('MOTION_START: paper TDF move started')
 
@@ -388,12 +1106,51 @@ class AdaptivePaperTdfPlayer(Node):
             self.latest_enc_roll_deg = float(d[2])
             self.latest_enc_pitch_count = float(d[3])
             self.latest_enc_roll_count = float(d[4])
+            self.latest_enc_wall = time.monotonic()
 
     def _encoder_diag_cb(self, msg: Float64MultiArray):
         # /payload/encoder/diagnostics data:
         # [time, arduino_ms, pitch_raw, roll_raw, pitch_count, roll_count,
-        #  serial_lines, parse_errors, stale]
+        #  optional imu1/imu2 accel/gyro values,
+        #  optional packet_age_ms, packet_seen, serial_lines, parse_errors, stale]
         d = msg.data
+        self.latest_enc_diag_wall = time.monotonic()
+        fields = []
+        if msg.layout.dim and msg.layout.dim[0].label:
+            fields = [name.strip() for name in msg.layout.dim[0].label.split(',')]
+        if fields and len(fields) <= len(d):
+            values = {name: float(d[index]) for index, name in enumerate(fields)}
+
+            def value(*names):
+                for name in names:
+                    if name in values:
+                        return values[name]
+                return None
+
+            self.latest_enc_time = value('time')
+            self.latest_enc_arduino_ms = value('arduino_ms')
+            self.latest_enc_pitch_raw = value('pitch_raw')
+            self.latest_enc_roll_raw = value('roll_raw')
+            self.latest_enc_pitch_count = value('pitch_count')
+            self.latest_enc_roll_count = value('roll_count')
+            self.latest_enc_imu1_ax = value('imu1_ax', 'imu1_ax_g')
+            self.latest_enc_imu1_ay = value('imu1_ay', 'imu1_ay_g')
+            self.latest_enc_imu1_az = value('imu1_az', 'imu1_az_g')
+            self.latest_enc_imu1_gx = value('imu1_gx', 'imu1_gx_dps')
+            self.latest_enc_imu1_gy = value('imu1_gy', 'imu1_gy_dps')
+            self.latest_enc_imu1_gz = value('imu1_gz', 'imu1_gz_dps')
+            self.latest_enc_imu2_ax = value('imu2_ax', 'imu2_ax_g')
+            self.latest_enc_imu2_ay = value('imu2_ay', 'imu2_ay_g')
+            self.latest_enc_imu2_az = value('imu2_az', 'imu2_az_g')
+            self.latest_enc_imu2_gx = value('imu2_gx', 'imu2_gx_dps')
+            self.latest_enc_imu2_gy = value('imu2_gy', 'imu2_gy_dps')
+            self.latest_enc_imu2_gz = value('imu2_gz', 'imu2_gz_dps')
+            self.latest_enc_packet_age_ms = value('packet_age_ms')
+            self.latest_enc_packet_seen = value('packet_seen')
+            self.latest_enc_serial_lines = value('serial_lines')
+            self.latest_enc_parse_errors = value('parse_errors')
+            self.latest_enc_stale = value('stale')
+            return
         if len(d) >= 9:
             self.latest_enc_time = float(d[0])
             self.latest_enc_arduino_ms = float(d[1])
@@ -401,53 +1158,275 @@ class AdaptivePaperTdfPlayer(Node):
             self.latest_enc_roll_raw = float(d[3])
             self.latest_enc_pitch_count = float(d[4])
             self.latest_enc_roll_count = float(d[5])
-            self.latest_enc_serial_lines = float(d[6])
-            self.latest_enc_parse_errors = float(d[7])
-            self.latest_enc_stale = float(d[8])
+            if len(d) >= 21:
+                self.latest_enc_imu1_ax = float(d[6])
+                self.latest_enc_imu1_ay = float(d[7])
+                self.latest_enc_imu1_az = float(d[8])
+                self.latest_enc_imu1_gx = float(d[9])
+                self.latest_enc_imu1_gy = float(d[10])
+                self.latest_enc_imu1_gz = float(d[11])
+                self.latest_enc_imu2_ax = float(d[12])
+                self.latest_enc_imu2_ay = float(d[13])
+                self.latest_enc_imu2_az = float(d[14])
+                self.latest_enc_imu2_gx = float(d[15])
+                self.latest_enc_imu2_gy = float(d[16])
+                self.latest_enc_imu2_gz = float(d[17])
+                if len(d) >= 23:
+                    self.latest_enc_packet_age_ms = float(d[18])
+                    self.latest_enc_packet_seen = float(d[19])
+                    self.latest_enc_serial_lines = float(d[20])
+                    self.latest_enc_parse_errors = float(d[21])
+                    self.latest_enc_stale = float(d[22])
+                else:
+                    self.latest_enc_serial_lines = float(d[18])
+                    self.latest_enc_parse_errors = float(d[19])
+                    self.latest_enc_stale = float(d[20])
+            else:
+                self.latest_enc_serial_lines = float(d[6])
+                self.latest_enc_parse_errors = float(d[7])
+                self.latest_enc_stale = float(d[8])
+
+    def _encoder_health_ready(self, now: float | None = None) -> bool:
+        """True only when the diagnostic stream explicitly reports healthy."""
+        check_wall = time.monotonic() if now is None else now
+        return (
+            self.latest_enc_diag_wall is not None
+            and check_wall - self.latest_enc_diag_wall
+            <= self.args.payload_fresh_timeout
+            and self.latest_enc_stale is not None
+            and math.isfinite(self.latest_enc_stale)
+            and self.latest_enc_stale < 0.5
+        )
+
+    def _payload_state_cb(self, msg: PayloadState):
+        # gantry_x/gantry_y are already rotated + sign-corrected from camera
+        # optical frame into gantry (cart) axes — see payload_frames.py.
+        self.latest_cam_gantry_x_mm = 1000.0 * float(msg.gantry_x)
+        self.latest_cam_gantry_y_mm = 1000.0 * float(msg.gantry_y)
+
+    def _traj_latency_cb(self, msg: Float64MultiArray):
+        if len(msg.data) < 26:
+            return
+        self.latest_traj_latency = [float(value) for value in msg.data[:26]]
+        self.latest_traj_latency_wall = time.monotonic()
+
+    def _capture_timed_payload_observations(
+        self,
+        cart_sample: GantryStateSample | None,
+    ) -> None:
+        """Record measured states nearest command start and physical peak.
+
+        Event offsets use ``/payload/pose_e_rel``'s own monotonic time base.
+        The velocity is the publisher's filtered relative-velocity estimate
+        plus measured cart velocity, so it is deliberately kept separate from
+        the sinusoid-projected state used to construct the shaper.
+        """
+        if (
+            self.latest_payload_time is None
+            or self.latest_swing_mm is None
+            or cart_sample is None
+        ):
+            return
+        raw_velocity_mm_s = (
+            getattr(self, 'latest_payload_rel_raw_vx_mm_s', None)
+            if self.args.axis == 'x'
+            else getattr(self, 'latest_payload_rel_raw_vy_mm_s', None)
+        )
+        relative_velocity_mm_s = (
+            raw_velocity_mm_s
+            if raw_velocity_mm_s is not None
+            and math.isfinite(raw_velocity_mm_s)
+            else (
+                self.latest_payload_rel_vx_mm_s
+                if self.args.axis == 'x'
+                else self.latest_payload_rel_vy_mm_s
+            )
+        )
+        if relative_velocity_mm_s is None:
+            return
+        cart_velocity_mm_s = 1000.0 * float(
+            cart_sample.vx if self.args.axis == 'x' else cart_sample.vy
+        )
+        world_velocity_mm_s = relative_velocity_mm_s + cart_velocity_mm_s
+        if not math.isfinite(world_velocity_mm_s):
+            return
+
+        values = (
+            (
+                'nonzero_ic_measured_command_start',
+                self.timed_profile_start_payload_time,
+            ),
+            ('nonzero_ic_measured_peak', self.timed_profile_peak_payload_time),
+        )
+        for attribute, target_time_s in values:
+            if target_time_s is None:
+                continue
+            current = getattr(self, attribute)
+            setattr(
+                self,
+                attribute,
+                closer_timed_payload_observation(
+                    current,
+                    sample_time_s=self.latest_payload_time,
+                    target_time_s=target_time_s,
+                    swing_mm=self.latest_swing_mm,
+                    world_payload_velocity_mm_s=world_velocity_mm_s,
+                ),
+            )
 
     def _payload_cb(self, msg: Float64MultiArray):
         index = 3 if self.args.axis == 'x' else 4
         if len(msg.data) <= index:
             self.get_logger().warn('Encoder relative array too short')
             return
+        payload_wall = time.monotonic()
 
         self.latest_payload_rel_x_mm = 1000.0 * float(msg.data[3]) if len(msg.data) > 3 else None
         self.latest_payload_rel_y_mm = 1000.0 * float(msg.data[4]) if len(msg.data) > 4 else None
         self.latest_payload_rel_z_mm = 1000.0 * float(msg.data[5]) if len(msg.data) > 5 else None
+        self.latest_payload_rel_vx_mm_s = (
+            1000.0 * float(msg.data[6])
+            if len(msg.data) > 6 and math.isfinite(float(msg.data[6]))
+            else None
+        )
+        self.latest_payload_rel_vy_mm_s = (
+            1000.0 * float(msg.data[7])
+            if len(msg.data) > 7 and math.isfinite(float(msg.data[7]))
+            else None
+        )
+        fields = []
+        if msg.layout.dim and msg.layout.dim[0].label:
+            fields = [
+                name.strip() for name in msg.layout.dim[0].label.split(',')
+            ]
+
+        def optional_field(name: str) -> float | None:
+            if name not in fields:
+                return None
+            field_index = fields.index(name)
+            if field_index >= len(msg.data):
+                return None
+            value = float(msg.data[field_index])
+            return value if math.isfinite(value) else None
+
+        raw_vx_m_s = optional_field('vx_rel_raw_m_s')
+        raw_vy_m_s = optional_field('vy_rel_raw_m_s')
+        self.latest_payload_rel_raw_vx_mm_s = (
+            None if raw_vx_m_s is None else 1000.0 * raw_vx_m_s
+        )
+        self.latest_payload_rel_raw_vy_mm_s = (
+            None if raw_vy_m_s is None else 1000.0 * raw_vy_m_s
+        )
+        self.latest_payload_encoder_sample_age_ms = optional_field(
+            'sample_age_ms')
 
         swing_m = float(msg.data[index])
-        cart_m = self._current_cart_axis_m()
+        cart_sample = self._cart_state_for_wall_time(payload_wall)
+        self.latest_cart_state_sample = cart_sample
+        if self.latest_gantry_state_sample is None:
+            self.latest_gantry_state_age_ms = None
+        else:
+            self.latest_gantry_state_age_ms = (
+                1000.0 * max(0.0, payload_wall - self.latest_gantry_state_sample.rx_wall)
+            )
+        cart_m = self._current_cart_axis_m(cart_sample)
         if cart_m is None:
             cart_m = 0.0
 
-        self.latest_payload_time = float(msg.data[0])
-        self.latest_payload_wall = time.monotonic()
+        payload_time = float(msg.data[0])
+        if math.isfinite(payload_time):
+            (
+                self.payload_clock_offset_s,
+                payload_queue_delay_s,
+                payload_clock_reset,
+            ) = update_payload_clock_calibration(
+                self.payload_clock_offset_s,
+                self.latest_payload_time,
+                payload_time,
+                payload_wall,
+            )
+            self.latest_payload_observed_clock_offset_s = (
+                payload_wall - payload_time
+            )
+            self.latest_payload_queue_delay_ms = (
+                1000.0 * payload_queue_delay_s
+            )
+            if payload_clock_reset:
+                self.get_logger().warn(
+                    'Payload publisher timestamp reset detected; restarted '
+                    'payload-clock calibration')
+        else:
+            self.latest_payload_observed_clock_offset_s = None
+            self.latest_payload_queue_delay_ms = None
+
+        self.latest_payload_time = payload_time
+        self.latest_payload_wall = payload_wall
+        self.latest_payload_age_ms = 0.0
         self.latest_swing_mm = swing_m * 1000.0
         self.latest_cart_q_mm = cart_m * 1000.0
         self.latest_payload_abs_mm = (cart_m + swing_m) * 1000.0
+        self._capture_timed_payload_observations(cart_sample)
+
+        if (
+            self.args.profile == 'nonzero-ic'
+            and self.wall_start is None
+            and (not self.args.excite or self.id_hold_start_wall is not None)
+            and math.isfinite(self.latest_payload_time)
+            and math.isfinite(self.latest_swing_mm)
+        ):
+            self.nonzero_ic_swing_samples.append((
+                self.latest_payload_time,
+                self.latest_swing_mm,
+            ))
+            history_s = max(self.args.tau + 1.0, 1.25 * self.args.tau)
+            cutoff_time = self.latest_payload_time - history_s
+            self.nonzero_ic_swing_samples = [
+                sample
+                for sample in self.nonzero_ic_swing_samples
+                if sample[0] >= cutoff_time
+            ]
 
         if self.final_zero_wall is not None:
             residual_t = self.latest_payload_wall - self.final_zero_wall
             if residual_t >= 0.0:
                 self.residual_samples.append((residual_t, self.latest_swing_mm))
 
-        if self.motion_started and self.identifier.t0 is None:
+        if (
+            self.args.profile != 'nonzero-ic'
+            and self.motion_started
+            and self.identifier.t0 is None
+        ):
             self._begin_id()
         if not self.motion_started or self.identifier.t0 is None:
             return
 
+        # Once the schedule is fixed, estimator updates cannot affect control.
+        # Keep this callback lightweight so payload and residual logging retain
+        # their full sample rate for the remainder of the run.
+        if self.schedule is not None:
+            if not self._id_updates_stopped_logged:
+                self._id_updates_stopped_logged = True
+                self.get_logger().info(
+                    'Online ID updates stopped after schedule lock; '
+                    'payload and residual logging continue')
+            return
+
         payload_abs_for_id = self._payload_abs_for_id()
-        est = self.identifier.update(
-            self.latest_payload_time,
-            payload_abs_for_id,
-            self.latest_cart_q_mm,
+        q_for_eq21 = (
+            None
+            if self.args.eq21_input_model == 'ideal_k'
+            else self.latest_cart_q_mm
         )
-        if est is not None and self.args.id_method == 'integral':
-            self._publish_estimate(est)
-            self._record_id_report_estimate(est)
-            self._maybe_lock_from_estimate(est)
-        elif est is not None:
-            self._publish_estimate(est)
+        if self.args.id_method == 'integral':
+            est = self.identifier.update(
+                self.latest_payload_time,
+                payload_abs_for_id,
+                q_for_eq21,
+            )
+            if est is not None:
+                self._publish_estimate(est)
+                self._record_id_report_estimate(est)
+                self._maybe_lock_from_estimate(est)
 
         paper2_est = self._update_paper2_step_estimate()
         if paper2_est is not None and self.args.id_method == 'paper2-step':
@@ -455,7 +1434,23 @@ class AdaptivePaperTdfPlayer(Node):
             self._record_id_report_estimate(paper2_est)
             self._maybe_lock_from_estimate(paper2_est)
 
-    def _current_cart_axis_m(self) -> float | None:
+        freq_est = self._update_freq_bank_estimate()
+        if freq_est is not None and self.args.id_method == 'freq-bank':
+            self._publish_estimate(freq_est)
+            self._record_id_report_estimate(freq_est)
+            self._maybe_lock_from_estimate(freq_est)
+
+        zero_est = self._update_zero_zeta_estimate()
+        if zero_est is not None and self.args.id_method == 'zero-zeta-ls':
+            self._publish_estimate(zero_est)
+            self._record_id_report_estimate(zero_est)
+            self._maybe_lock_from_estimate(zero_est)
+
+    def _current_cart_axis_m(
+        self, sample: GantryStateSample | None = None
+    ) -> float | None:
+        if sample is not None:
+            return sample.x if self.args.axis == 'x' else sample.y
         if self.latest_gantry_state is None:
             return None
         return (
@@ -497,7 +1492,12 @@ class AdaptivePaperTdfPlayer(Node):
         self.latest_id_filtered_swing_mm = None
         self._id_filter_time = None
         self.mode_fit_samples = []
-        self.latest_mode_fit_estimate = None
+        self.zero_zeta_samples = []
+        self.latest_zero_zeta_estimate = None
+        self.latest_zero_zeta_score = None
+        self.latest_zero_zeta_rmse = None
+        self.latest_zero_zeta_amp = None
+        self.latest_freq_bank_estimate = None
         self.latest_paper2_estimate = None
         self.latest_two_mode_estimate = None
         self.latest_two_mode_t2 = None
@@ -506,6 +1506,9 @@ class AdaptivePaperTdfPlayer(Node):
         self.latest_two_mode_amp_ratio = None
         self.latest_two_mode_nrmse = None
         self._last_mode_fit_log_t = -1.0
+        self._last_zero_zeta_update_t = -1.0
+        self._zero_zeta_future = None
+        self._last_freq_bank_update_t = -1.0
         self._last_two_mode_update_t = -1.0
         payload_abs_for_id = self._payload_abs_for_id()
         self.identifier.start(
@@ -517,8 +1520,68 @@ class AdaptivePaperTdfPlayer(Node):
         self.get_logger().info(
             f'ID started: x={payload_abs_for_id:.2f} mm q={q:.2f} mm')
 
-    def _update_mode_fit_estimate(self) -> Estimate | None:
-        if self.args.id_method not in ('mode-fit', 'paper2-step'):
+    @staticmethod
+    def _fit_zero_zeta_grid(
+        t: float,
+        x: float,
+        swing_p2p: float,
+        times: np.ndarray,
+        swing: np.ndarray,
+        t_min: float,
+        t_max: float,
+        grid_count: int,
+        min_amp: float,
+        max_score: float,
+    ) -> tuple[float, float, float, float, float, float, float, float, float] | None:
+        """Fit all period candidates off the ROS callback thread."""
+        tc = times - float(times[0])
+        periods = np.linspace(t_min, t_max, max(5, grid_count))
+        omegas = math.pi / periods
+        phase = omegas[:, None] * tc[None, :]
+        design = np.empty((len(periods), len(tc), 4), dtype=float)
+        design[:, :, 0] = 1.0
+        design[:, :, 1] = tc
+        design[:, :, 2] = np.cos(phase)
+        design[:, :, 3] = np.sin(phase)
+
+        try:
+            xtx = np.einsum('gni,gnj->gij', design, design, optimize=True)
+            xty = np.einsum('gni,n->gi', design, swing, optimize=True)
+            coefs = np.linalg.solve(xtx, xty)
+            pred = np.einsum('gni,gi->gn', design, coefs, optimize=True)
+            rmse = np.sqrt(np.mean((swing[None, :] - pred) ** 2, axis=1))
+            amp = np.hypot(coefs[:, 2], coefs[:, 3])
+            score = rmse / np.maximum(amp, 1.0e-9)
+            cond = np.sqrt(np.linalg.cond(xtx))
+        except (FloatingPointError, np.linalg.LinAlgError, ValueError):
+            return None
+
+        valid = (
+            np.isfinite(score)
+            & np.isfinite(rmse)
+            & np.isfinite(amp)
+            & np.isfinite(cond)
+            & (amp >= min_amp)
+            & (score <= max_score)
+        )
+        if not np.any(valid):
+            return None
+        valid_indices = np.flatnonzero(valid)
+        best_index = int(valid_indices[np.argmin(score[valid])])
+        return (
+            t,
+            x,
+            swing_p2p,
+            float(score[best_index]),
+            float(periods[best_index]),
+            float(omegas[best_index]),
+            float(cond[best_index]),
+            float(rmse[best_index]),
+            float(amp[best_index]),
+        )
+
+    def _update_zero_zeta_estimate(self) -> Estimate | None:
+        if self.args.id_method != 'zero-zeta-ls':
             return None
         if (
             self.identifier.t0 is None
@@ -530,15 +1593,122 @@ class AdaptivePaperTdfPlayer(Node):
         t = self.latest_payload_time - self.identifier.t0
         if t <= 0.0:
             return None
+
+        self.zero_zeta_samples.append((t, self.latest_swing_mm))
+        keep_after = max(
+            0.0,
+            t - max(self.args.zero_zeta_history_s, self.args.zero_zeta_window_s),
+        )
+        self.zero_zeta_samples = [
+            sample for sample in self.zero_zeta_samples if sample[0] >= keep_after
+        ]
+
+        completed = None
+        if self._zero_zeta_future is not None and self._zero_zeta_future.done():
+            try:
+                completed = self._zero_zeta_future.result()
+            except Exception as exc:
+                self.get_logger().error(f'Zero-zeta ID worker failed: {exc}')
+            self._zero_zeta_future = None
+
+        est = None
+        if completed is not None:
+            fit_t, fit_x, swing_p2p, score, T, omega, cond, rmse, amp = completed
+            est = Estimate(
+                t=fit_t,
+                x=fit_x,
+                i1=float('nan'),
+                i2=float('nan'),
+                i3=float('nan'),
+                cond_b=score,
+                omega_n=omega,
+                zeta=0.0,
+                T=T,
+                A0=float('nan'),
+                A1=float('nan'),
+                A2=float('nan'),
+            )
+            self.latest_zero_zeta_estimate = est
+            self.latest_zero_zeta_score = score
+            self.latest_zero_zeta_rmse = rmse
+            self.latest_zero_zeta_amp = amp
+            if fit_t - self._last_mode_fit_log_t >= self.args.print_period:
+                self._last_mode_fit_log_t = fit_t
+                self.get_logger().info(
+                    f'zero-zeta LS ID: t={fit_t:.3f}s T={T:.4f}s '
+                    f'omega={omega:.4f} amp={amp:.2f}mm p2p={swing_p2p:.2f}mm '
+                    f'nrmse={score:.3f} rmse={rmse:.3f} cond={cond:.3e}')
+
+        if t < self.args.zero_zeta_after_s:
+            return est
+        if self._zero_zeta_future is not None:
+            return est
+        if t - self._last_zero_zeta_update_t < self.args.zero_zeta_update_period_s:
+            return est
+        self._last_zero_zeta_update_t = t
+
+        window_start = (
+            0.0
+            if self.args.zero_zeta_window_s <= 0.0
+            else max(0.0, t - self.args.zero_zeta_window_s)
+        )
+        window = [
+            sample
+            for sample in self.zero_zeta_samples
+            if window_start <= sample[0] <= t
+        ]
+        if len(window) < self.args.zero_zeta_min_samples:
+            return est
+
+        times = np.array([sample[0] for sample in window], dtype=float)
+        swing = np.array([sample[1] for sample in window], dtype=float)
+        if not np.all(np.isfinite(times)) or not np.all(np.isfinite(swing)):
+            return est
+
+        swing_p2p = float(np.max(swing) - np.min(swing))
+        if swing_p2p < self.args.zero_zeta_min_p2p_mm:
+            return est
+
+        if self._zero_zeta_executor is not None:
+            self._zero_zeta_future = self._zero_zeta_executor.submit(
+                self._fit_zero_zeta_grid,
+                t,
+                float(self.latest_swing_mm),
+                swing_p2p,
+                times,
+                swing,
+                self.args.zero_zeta_t_min,
+                self.args.zero_zeta_t_max,
+                self.args.zero_zeta_grid_count,
+                self.args.zero_zeta_min_amp_mm,
+                self.args.zero_zeta_max_norm_rmse,
+            )
+        return est
+
+    def _update_freq_bank_estimate(self) -> Estimate | None:
+        if self.args.id_method != 'freq-bank':
+            return None
+        if (
+            self.identifier.t0 is None
+            or self.latest_payload_time is None
+            or self.latest_swing_mm is None
+        ):
+            return None
+
+        t = self.latest_payload_time - self.identifier.t0
+        if t <= 0.0:
+            return None
+
         self.mode_fit_samples.append((t, self.latest_swing_mm))
         keep_after = max(0.0, t - max(self.args.mode_fit_history_s, self.args.mode_fit_window_s))
         self.mode_fit_samples = [
             sample for sample in self.mode_fit_samples if sample[0] >= keep_after
         ]
-        if self.args.id_method == 'paper2-step':
-            return None
         if t < self.args.mode_fit_after_s:
             return None
+        if t - self._last_freq_bank_update_t < self.args.freq_bank_update_period_s:
+            return None
+        self._last_freq_bank_update_t = t
 
         window_start = max(0.0, t - self.args.mode_fit_window_s)
         window = [
@@ -558,63 +1728,68 @@ class AdaptivePaperTdfPlayer(Node):
         if swing_p2p < self.args.mode_fit_min_p2p_mm:
             return None
 
-        t_center = times - float(np.mean(times))
-        y = swing - float(np.mean(swing))
-        best: tuple[float, float, float, float, float, float, np.ndarray] | None = None
+        tau = times - float(times[0])
+        y = swing.astype(float)
+        # Remove constant and slow drift so coherent oscillation dominates the bank.
+        try:
+            trend_design = np.column_stack((np.ones_like(tau), tau))
+            trend_coef, _, _, _ = np.linalg.lstsq(trend_design, y, rcond=None)
+            y = y - trend_design @ trend_coef
+        except np.linalg.LinAlgError:
+            y = y - float(np.mean(y))
+        y = y - float(np.mean(y))
+
+        y_energy = float(np.dot(y, y))
+        if y_energy <= 1.0e-9:
+            return None
+
+        weights = np.hanning(len(y))
+        if not np.any(weights > 0.0):
+            weights = np.ones_like(y)
+        yw = y * weights
+        best: tuple[float, float, float, float, float] | None = None
+        powers: list[float] = []
         n_grid = max(5, self.args.mode_fit_grid_count)
         for T in np.linspace(self.args.mode_fit_t_min, self.args.mode_fit_t_max, n_grid):
             if T <= 0.0:
                 continue
             omega = math.pi / float(T)
-            design = np.column_stack(
-                (
-                    np.ones_like(t_center),
-                    t_center,
-                    np.cos(omega * t_center),
-                    np.sin(omega * t_center),
-                )
-            )
-            try:
-                coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-                cond = float(np.linalg.cond(design))
-            except np.linalg.LinAlgError:
+            phase = omega * (times - float(times[0]))
+            c = np.cos(phase) * weights
+            s = np.sin(phase) * weights
+            cc = float(np.dot(c, c))
+            ss = float(np.dot(s, s))
+            if cc <= 1.0e-12 or ss <= 1.0e-12:
                 continue
-            pred = design @ coef
-            err = y - pred
-            rmse = float(np.sqrt(np.mean(err * err)))
-            amp = float(math.hypot(float(coef[2]), float(coef[3])))
+            ac = float(np.dot(yw, c)) / cc
+            bs = float(np.dot(yw, s)) / ss
+            pred = ac * np.cos(phase) + bs * np.sin(phase)
+            amp = float(math.hypot(ac, bs))
             if amp < self.args.mode_fit_min_amp_mm:
                 continue
+            err = y - pred
+            rmse = float(np.sqrt(np.mean(err * err)))
             norm_rmse = rmse / max(amp, 1.0e-9)
-            if not all(math.isfinite(v) for v in (cond, rmse, amp, norm_rmse)):
+            if norm_rmse > self.args.mode_fit_max_norm_rmse:
                 continue
-            score = norm_rmse + self.args.mode_fit_cond_weight * math.log10(max(cond, 1.0))
-            if best is None or score < best[0]:
-                best = (score, float(T), omega, cond, rmse, amp, coef)
+            # Normalized coherent power in [0, ~1]; larger means stronger frequency support.
+            power = float((ac * ac * cc + bs * bs * ss) / max(y_energy, 1.0e-9))
+            if not all(math.isfinite(v) for v in (power, amp, rmse, norm_rmse)):
+                continue
+            powers.append(power)
+            if best is None or power > best[0]:
+                best = (power, float(T), omega, amp, norm_rmse)
 
-        if best is None:
+        if best is None or not powers:
             return None
-        score, T, omega, cond, rmse, amp, _coef = best
-        norm_rmse = rmse / max(amp, 1.0e-9)
-        if norm_rmse > self.args.mode_fit_max_norm_rmse:
+
+        power, T, omega, amp, norm_rmse = best
+        powers_sorted = sorted(powers, reverse=True)
+        second = powers_sorted[1] if len(powers_sorted) > 1 else 1.0e-12
+        ratio = power / max(second, 1.0e-12)
+        if ratio < self.args.freq_bank_min_ratio:
             return None
-        grid_step = (
-            (self.args.mode_fit_t_max - self.args.mode_fit_t_min)
-            / max(1, self.args.mode_fit_grid_count - 1)
-        )
-        edge_margin = max(self.args.mode_fit_edge_margin_s, 1.5 * grid_step)
-        if (
-            T <= self.args.mode_fit_t_min + edge_margin
-            or T >= self.args.mode_fit_t_max - edge_margin
-        ):
-            if t - self._last_mode_fit_log_t >= self.args.print_period:
-                self._last_mode_fit_log_t = t
-                self.get_logger().info(
-                    f'mode-fit rejected edge solution: t={t:.3f}s T={T:.4f}s '
-                    f'range=[{self.args.mode_fit_t_min:.3f},{self.args.mode_fit_t_max:.3f}] '
-                    f'edge_margin={edge_margin:.4f}s amp={amp:.2f}mm '
-                    f'nrmse={norm_rmse:.3f} cond={cond:.3e}')
-            return None
+        cond_b = 1.0 / max(power * max(ratio - 1.0, 1.0e-3), 1.0e-6)
 
         est = Estimate(
             t=t,
@@ -622,7 +1797,7 @@ class AdaptivePaperTdfPlayer(Node):
             i1=float('nan'),
             i2=float('nan'),
             i3=float('nan'),
-            cond_b=cond,
+            cond_b=cond_b,
             omega_n=omega,
             zeta=0.0,
             T=T,
@@ -630,13 +1805,13 @@ class AdaptivePaperTdfPlayer(Node):
             A1=float('nan'),
             A2=float('nan'),
         )
-        self.latest_mode_fit_estimate = est
+        self.latest_freq_bank_estimate = est
         if t - self._last_mode_fit_log_t >= self.args.print_period:
             self._last_mode_fit_log_t = t
             self.get_logger().info(
-                f'mode-fit ID: t={t:.3f}s T={T:.4f}s omega={omega:.4f} '
-                f'amp={amp:.2f}mm p2p={swing_p2p:.2f}mm '
-                f'nrmse={norm_rmse:.3f} cond={cond:.3e} score={score:.3f}')
+                f'freq-bank ID: t={t:.3f}s T={T:.4f}s omega={omega:.4f} '
+                f'power={power:.3f} ratio={ratio:.3f} condB={cond_b:.3e} '
+                f'amp={amp:.2f}mm p2p={swing_p2p:.2f}mm nrmse={norm_rmse:.3f}')
         return est
 
     def _update_two_mode_fit_estimate(self) -> Estimate | None:
@@ -938,13 +2113,18 @@ class AdaptivePaperTdfPlayer(Node):
             return
         self.id_report_estimates.append(est)
 
-    def _configure_robust_schedule(self):
+    def _configure_model_schedule(self):
         omega_n = math.sqrt(self.args.gravity_m_s2 / self.args.robust_rope_length_m)
         T = self.args.robust_t_scale * math.pi / omega_n
-        A0, A1, A2 = self._standard_zvd_amplitudes(self.args.robust_zeta)
+        if self.args.profile == 'zv':
+            A0, A1, A2 = self._standard_zv_amplitudes(self.args.robust_zeta)
+            source = f'nonrobust_zv_L{self.args.robust_rope_length_m:.3f}m'
+        else:
+            A0, A1, A2 = self._standard_zvd_amplitudes(self.args.robust_zeta)
+            source = f'robust_zvd_L{self.args.robust_rope_length_m:.3f}m'
         self.initial_velocity_mm_s = self.direction * A0 * self.vmax_abs_mm_s
         self.schedule = LockedSchedule(
-            source=f'robust_zvd_L{self.args.robust_rope_length_m:.3f}m',
+            source=source,
             locked_at=0.0,
             id_time=float('nan'),
             id_T=float('nan'),
@@ -957,6 +2137,971 @@ class AdaptivePaperTdfPlayer(Node):
             shaper_zeta=self.args.robust_zeta,
             cond_b=float('nan'),
         )
+
+    def _update_nonzero_ic_frequency_estimate(
+        self,
+    ) -> FreeSwingFrequencyEstimate:
+        """Fit the latest tau seconds without blocking ROS sample callbacks."""
+        now = time.monotonic()
+        pending = self._nonzero_ic_fit_future
+        if pending is not None:
+            if not pending.done():
+                raise NonzeroIcNotReady('adaptive frequency fit is running')
+            self._nonzero_ic_fit_future = None
+            try:
+                estimate = pending.result()
+            except Exception as exc:
+                self._last_nonzero_ic_fit_error = str(exc)
+                raise NonzeroIcNotReady(str(exc)) from exc
+            return self._accept_nonzero_ic_frequency_estimate(estimate, now)
+
+        if (
+            now - self._last_nonzero_ic_fit_wall
+            < self.args.nonzero_ic_fit_update_period_s
+        ):
+            if self.nonzero_ic_frequency_estimate is not None:
+                return self.nonzero_ic_frequency_estimate
+            raise NonzeroIcNotReady(self._last_nonzero_ic_fit_error)
+        self._last_nonzero_ic_fit_wall = now
+        self.nonzero_ic_frequency_estimate = None
+
+        if not self.nonzero_ic_swing_samples:
+            self._last_nonzero_ic_fit_error = 'no free-swing samples are available'
+            raise NonzeroIcNotReady(self._last_nonzero_ic_fit_error)
+        end_time_s = self.nonzero_ic_swing_samples[-1][0]
+        window_start_s = end_time_s - self.args.tau
+        window = [
+            sample
+            for sample in self.nonzero_ic_swing_samples
+            if sample[0] >= window_start_s
+        ]
+        if len(window) < self.args.nonzero_ic_min_fit_samples:
+            self._last_nonzero_ic_fit_error = (
+                f'adaptive frequency fit has {len(window)}/'
+                f'{self.args.nonzero_ic_min_fit_samples} required samples'
+            )
+            raise NonzeroIcNotReady(self._last_nonzero_ic_fit_error)
+        window_duration_s = window[-1][0] - window[0][0]
+        minimum_window_s = max(0.5, 0.90 * self.args.tau)
+        if window_duration_s < minimum_window_s:
+            self._last_nonzero_ic_fit_error = (
+                f'adaptive frequency window is {window_duration_s:.2f}/'
+                f'{minimum_window_s:.2f}s'
+            )
+            raise NonzeroIcNotReady(self._last_nonzero_ic_fit_error)
+
+        try:
+            executor = self._nonzero_ic_fit_executor
+            if executor is not None:
+                self._nonzero_ic_fit_future = executor.submit(
+                    estimate_free_swing_frequency,
+                    tuple(window),
+                    omega_min_rad_s=self.args.nonzero_ic_omega_min_rad_s,
+                    omega_max_rad_s=self.args.nonzero_ic_omega_max_rad_s,
+                    grid_count=self.args.nonzero_ic_frequency_grid_count,
+                )
+                raise NonzeroIcNotReady('adaptive frequency fit is running')
+            estimate = estimate_free_swing_frequency(
+                window,
+                omega_min_rad_s=self.args.nonzero_ic_omega_min_rad_s,
+                omega_max_rad_s=self.args.nonzero_ic_omega_max_rad_s,
+                grid_count=self.args.nonzero_ic_frequency_grid_count,
+            )
+        except ValueError as exc:
+            self._last_nonzero_ic_fit_error = str(exc)
+            raise NonzeroIcNotReady(str(exc)) from exc
+
+        return self._accept_nonzero_ic_frequency_estimate(estimate, now)
+
+    def _accept_nonzero_ic_frequency_estimate(
+        self,
+        estimate: FreeSwingFrequencyEstimate,
+        now: float,
+    ) -> FreeSwingFrequencyEstimate:
+        """Apply quality gates and publish a completed worker estimate."""
+
+        grid_step = (
+            self.args.nonzero_ic_omega_max_rad_s
+            - self.args.nonzero_ic_omega_min_rad_s
+        ) / max(self.args.nonzero_ic_frequency_grid_count - 1, 1)
+        if (
+            estimate.omega_n_rad_s
+            <= self.args.nonzero_ic_omega_min_rad_s + grid_step
+            or estimate.omega_n_rad_s
+            >= self.args.nonzero_ic_omega_max_rad_s - grid_step
+        ):
+            self._last_nonzero_ic_fit_error = (
+                f'adaptive omega={estimate.omega_n_rad_s:.4f}rad/s is at the '
+                'frequency-search boundary'
+            )
+            raise NonzeroIcNotReady(self._last_nonzero_ic_fit_error)
+        if estimate.amplitude_mm < self.args.nonzero_ic_min_fit_amplitude_mm:
+            self._last_nonzero_ic_fit_error = (
+                f'free-swing amplitude={estimate.amplitude_mm:.2f}mm is below '
+                f'{self.args.nonzero_ic_min_fit_amplitude_mm:.2f}mm'
+            )
+            raise NonzeroIcNotReady(self._last_nonzero_ic_fit_error)
+        if estimate.normalized_rmse > self.args.nonzero_ic_max_fit_nrmse:
+            self._last_nonzero_ic_fit_error = (
+                f'free-swing fit NRMSE={estimate.normalized_rmse:.3f} exceeds '
+                f'{self.args.nonzero_ic_max_fit_nrmse:.3f}'
+            )
+            raise NonzeroIcNotReady(self._last_nonzero_ic_fit_error)
+
+        self.nonzero_ic_frequency_estimate = estimate
+        self._last_nonzero_ic_fit_error = ''
+        if now - self._last_nonzero_ic_fit_log_wall >= 1.0:
+            self._last_nonzero_ic_fit_log_wall = now
+            effective_length_m = (
+                self.args.gravity_m_s2 / estimate.omega_n_rad_s**2
+            )
+            self.get_logger().info(
+                'Adaptive free-swing ID: '
+                f'tau={estimate.window_duration_s:.3f}s '
+                f'n={estimate.sample_count} '
+                f'omega_n={estimate.omega_n_rad_s:.6f}rad/s '
+                f'L_eff={effective_length_m:.4f}m '
+                f'amplitude={estimate.amplitude_mm:.2f}mm '
+                f'RMSE={estimate.rmse_mm:.2f}mm '
+                f'NRMSE={estimate.normalized_rmse:.4f}'
+            )
+        return estimate
+
+    def _configure_nonzero_ic_schedule(
+        self, state_capture_wall_override: float | None = None
+    ) -> float:
+        """Capture the fitted live state and solve the supplied closed form.
+
+        Return the monotonic wall time represented by the captured state.  A
+        frequency grid fit can take several control ticks, so the fitted state
+        is projected from the latest payload sample to this time before the
+        closed-form schedule is solved.
+        """
+        frequency_estimate: FreeSwingFrequencyEstimate | None = None
+        fitted_swing_mm: float | None = None
+        fitted_relative_velocity_mm_s: float | None = None
+        fitted_command_start_swing_mm: float | None = None
+        fitted_command_start_relative_velocity_mm_s: float | None = None
+        state_capture_wall = time.monotonic()
+        state_prediction_age_s = 0.0
+        if self.args.nonzero_ic_adaptive_frequency:
+            if (
+                self.latest_payload_time is None
+                or self.latest_payload_wall is None
+                or self.payload_clock_offset_s is None
+            ):
+                raise NonzeroIcNotReady(
+                    'calibrated payload sample time is unavailable')
+            frequency_estimate = self._update_nonzero_ic_frequency_estimate()
+            # The grid fit above is intentionally performed before selecting
+            # the command-start state.  Project the fitted sinusoid across the
+            # elapsed wall time so solver latency does not make x0/v0 stale.
+            state_capture_wall = (
+                time.monotonic()
+                if state_capture_wall_override is None
+                else float(state_capture_wall_override)
+            )
+            projected_payload_time = payload_time_at_wall(
+                state_capture_wall,
+                self.payload_clock_offset_s,
+            )
+            state_prediction_age_s = max(
+                0.0,
+                projected_payload_time - self.latest_payload_time,
+            )
+            fitted_swing_mm, fitted_relative_velocity_mm_s = (
+                frequency_estimate.oscillation_state_at(projected_payload_time)
+            )
+            command_start_wall = state_capture_wall - (
+                1.0e-3 * self.args.timed_profile_actuation_lead_ms
+                if self.args.controller_timed_profile
+                else 0.0
+            )
+            command_start_payload_time = payload_time_at_wall(
+                command_start_wall,
+                self.payload_clock_offset_s,
+            )
+            (
+                fitted_command_start_swing_mm,
+                fitted_command_start_relative_velocity_mm_s,
+            ) = frequency_estimate.oscillation_state_at(
+                command_start_payload_time)
+
+        if self.args.initial_swing_mm is not None:
+            world_swing_mm = float(self.args.initial_swing_mm)
+        elif fitted_swing_mm is not None:
+            world_swing_mm = fitted_swing_mm
+        elif self.latest_swing_mm is not None and math.isfinite(self.latest_swing_mm):
+            world_swing_mm = float(self.latest_swing_mm)
+        else:
+            raise ValueError(
+                'initial swing is unavailable; provide --initial-swing-mm or '
+                'a fresh payload relative-position sample'
+            )
+
+        if self.args.initial_payload_velocity_mm_s is not None:
+            world_payload_velocity_mm_s = float(
+                self.args.initial_payload_velocity_mm_s
+            )
+        else:
+            relative_velocity_mm_s = (
+                fitted_relative_velocity_mm_s
+                if fitted_relative_velocity_mm_s is not None
+                else (
+                    self.latest_payload_rel_vx_mm_s
+                    if self.args.axis == 'x'
+                    else self.latest_payload_rel_vy_mm_s
+                )
+            )
+            cart_sample = self.latest_cart_state_sample or self.latest_gantry_state_sample
+            if relative_velocity_mm_s is None or cart_sample is None:
+                raise ValueError(
+                    'initial payload velocity is unavailable; provide '
+                    '--initial-payload-velocity-mm-s or publish velocity in '
+                    '/payload/pose_e_rel'
+                )
+            cart_velocity_mm_s = 1000.0 * float(
+                cart_sample.vx if self.args.axis == 'x' else cart_sample.vy
+            )
+            world_payload_velocity_mm_s = (
+                float(relative_velocity_mm_s) + cart_velocity_mm_s
+            )
+
+        if not math.isfinite(world_payload_velocity_mm_s):
+            raise ValueError('initial payload velocity must be finite')
+
+        # The closed form is written in a positive direction-of-travel frame.
+        # Transform world-axis measurements for negative moves, then transform
+        # the resulting positive velocity command back in _axis_velocity_for_time.
+        signed_swing_mm = self.direction * world_swing_mm
+        signed_payload_velocity_mm_s = (
+            self.direction * world_payload_velocity_mm_s
+        )
+        if self.args.nonzero_ic_start_at_peak:
+            velocity_tolerance = (
+                self.args.nonzero_ic_peak_velocity_tolerance_mm_s
+            )
+            if signed_swing_mm <= 0.0:
+                raise NonzeroIcNotReady(
+                    'waiting for the positive payload peak in the direction '
+                    f'of travel: signed swing={signed_swing_mm:.2f}mm'
+                )
+            if abs(signed_payload_velocity_mm_s) > velocity_tolerance:
+                raise NonzeroIcNotReady(
+                    'waiting for zero payload velocity at the positive peak: '
+                    f'payload_v={world_payload_velocity_mm_s:.2f}mm/s, '
+                    f'tolerance=+/-{velocity_tolerance:.2f}mm/s'
+                )
+        if frequency_estimate is not None:
+            fitted_omega_n = frequency_estimate.omega_n_rad_s
+        else:
+            fitted_omega_n = (
+                self.args.nonzero_ic_omega_rad_s
+                if self.args.nonzero_ic_omega_rad_s > 0.0
+                else math.sqrt(
+                    self.args.gravity_m_s2 / self.args.robust_rope_length_m
+                )
+            )
+        solver_fit_omega_n = fitted_omega_n
+        amplitude_correction = None
+        if (
+            frequency_estimate is not None
+            and self.args.nonzero_ic_finite_amplitude_correction
+        ):
+            try:
+                amplitude_correction = correct_finite_amplitude_frequency(
+                    fitted_omega_n,
+                    frequency_estimate.amplitude_mm,
+                    self.args.robust_rope_length_m,
+                )
+            except ValueError as exc:
+                raise NonzeroIcNotReady(
+                    f'finite-amplitude frequency correction failed: {exc}'
+                ) from exc
+            solver_fit_omega_n = amplitude_correction.small_angle_omega_rad_s
+        omega_n = select_nonzero_ic_shaper_frequency(
+            solver_fit_omega_n,
+            self.args.nonzero_ic_shaper_frequency_scale,
+            self.args.nonzero_ic_shaper_omega_rad_s,
+        )
+        shaper_frequency_mode = (
+            'fixed'
+            if self.args.nonzero_ic_shaper_omega_rad_s > 0.0
+            else (
+                'amplitude-corrected-scaled-fit'
+                if amplitude_correction is not None
+                else 'scaled-fit'
+            )
+        )
+        robust_solution: RobustNonzeroIcShaper | None = None
+        try:
+            if self.args.nonzero_ic_robust:
+                robust_solution = solve_robust_nonzero_ic_shaper(
+                    initial_swing_mm=signed_swing_mm,
+                    initial_payload_velocity_mm_s=signed_payload_velocity_mm_s,
+                    maximum_speed_mm_s=self.vmax_abs_mm_s,
+                    omega_n_rad_s=omega_n,
+                    move_duration_s=self.tf,
+                    frequency_band_fraction=(
+                        self.args.nonzero_ic_robust_band_fraction
+                    ),
+                )
+                solution = None
+                positive_profile_events = tuple(
+                    (time_s, gain * self.vmax_abs_mm_s)
+                    for time_s, gain in robust_solution.gain_events()
+                )
+                schedule_tail_s = robust_solution.tail_s
+                schedule_amplitudes = robust_solution.start_amplitudes
+                terminal_position_residual_mm = (
+                    robust_solution.terminal_position_residual_mm
+                )
+                terminal_velocity_residual_mm_s = (
+                    robust_solution.terminal_velocity_residual_mm_s
+                )
+            else:
+                solution = solve_nonzero_ic_shaper(
+                    initial_swing_mm=signed_swing_mm,
+                    initial_payload_velocity_mm_s=signed_payload_velocity_mm_s,
+                    maximum_speed_mm_s=self.vmax_abs_mm_s,
+                    omega_n_rad_s=omega_n,
+                    move_duration_s=self.tf,
+                    maximum_absolute_gain=(
+                        self.args.nonzero_ic_max_command_speed_mm_s
+                        / self.vmax_abs_mm_s
+                    ),
+                )
+                if not solution.is_forward_only:
+                    raise NonzeroIcNotReady(
+                        f'forward-only gains not ready: A0={solution.A0:.6f}, '
+                        f'A1={solution.A1:.6f}'
+                    )
+                positive_profile_events = (
+                    (0.0, solution.A0 * self.vmax_abs_mm_s),
+                    (solution.switch_time_s, self.vmax_abs_mm_s),
+                    (self.tf, solution.A1 * self.vmax_abs_mm_s),
+                    (self.tf + solution.switch_time_s, 0.0),
+                )
+                schedule_tail_s = solution.switch_time_s
+                schedule_amplitudes = (solution.A0, solution.A1, 0.0)
+                terminal_position_residual_mm = (
+                    solution.terminal_position_residual_mm
+                )
+                terminal_velocity_residual_mm_s = (
+                    solution.terminal_velocity_residual_mm_s
+                )
+        except ValueError as exc:
+            raise NonzeroIcNotReady(str(exc)) from exc
+        execution_cart_sample = (
+            self.latest_cart_state_sample or self.latest_gantry_state_sample
+        )
+        if execution_cart_sample is None:
+            raise ValueError('cart position is unavailable for workspace validation')
+        start_cart_mm = 1000.0 * float(
+            execution_cart_sample.x
+            if self.args.axis == 'x'
+            else execution_cart_sample.y
+        )
+        signed_event_positions = [0.0]
+        position_mm = 0.0
+        previous_time_s = 0.0
+        previous_velocity_mm_s = 0.0
+        for event_time_s, velocity_mm_s in positive_profile_events:
+            position_mm += previous_velocity_mm_s * (
+                event_time_s - previous_time_s
+            )
+            signed_event_positions.append(position_mm)
+            previous_time_s = event_time_s
+            previous_velocity_mm_s = velocity_mm_s
+        signed_event_positions_mm = tuple(signed_event_positions)
+        if abs(position_mm - self.args.target_distance_mm) > 1.0e-5:
+            raise ValueError(
+                'nonzero-IC profile failed exact-travel verification: '
+                f'predicted={position_mm:.6f}mm, '
+                f'target={self.args.target_distance_mm:.6f}mm')
+        world_event_positions_mm = tuple(
+            start_cart_mm + self.direction * position
+            for position in signed_event_positions_mm
+        )
+        workspace_low_mm = (
+            self.args.workspace_min_mm + self.args.workspace_margin_mm
+        )
+        workspace_high_mm = (
+            self.args.workspace_max_mm - self.args.workspace_margin_mm
+        )
+        if (
+            min(world_event_positions_mm) < workspace_low_mm
+            or max(world_event_positions_mm) > workspace_high_mm
+        ):
+            raise ValueError(
+                'nonzero-IC transient leaves the configured workspace: '
+                f'predicted=[{min(world_event_positions_mm):.1f}, '
+                f'{max(world_event_positions_mm):.1f}]mm, '
+                f'allowed=[{workspace_low_mm:.1f}, {workspace_high_mm:.1f}]mm'
+            )
+        self.nonzero_ic_initial_swing_mm = world_swing_mm
+        self.nonzero_ic_initial_payload_velocity_mm_s = (
+            world_payload_velocity_mm_s
+        )
+        self.nonzero_ic_predicted_peak_swing_mm = world_swing_mm
+        self.nonzero_ic_predicted_peak_payload_velocity_mm_s = (
+            world_payload_velocity_mm_s
+        )
+        if fitted_command_start_swing_mm is not None:
+            self.nonzero_ic_predicted_command_start_swing_mm = (
+                fitted_command_start_swing_mm
+            )
+        if fitted_command_start_relative_velocity_mm_s is not None:
+            command_cart_sample = (
+                self.latest_cart_state_sample or self.latest_gantry_state_sample
+            )
+            command_cart_velocity_mm_s = (
+                0.0
+                if command_cart_sample is None
+                else 1000.0 * float(
+                    command_cart_sample.vx
+                    if self.args.axis == 'x'
+                    else command_cart_sample.vy
+                )
+            )
+            self.nonzero_ic_predicted_command_start_payload_velocity_mm_s = (
+                fitted_command_start_relative_velocity_mm_s
+                + command_cart_velocity_mm_s
+            )
+        self.nonzero_ic_fitted_omega_rad_s = fitted_omega_n
+        self.nonzero_ic_small_angle_omega_rad_s = solver_fit_omega_n
+        self.nonzero_ic_fitted_amplitude_angle_deg = (
+            None
+            if amplitude_correction is None
+            else math.degrees(amplitude_correction.amplitude_angle_rad)
+        )
+        self.nonzero_ic_frequency_correction_factor = (
+            None
+            if amplitude_correction is None
+            else amplitude_correction.correction_factor
+        )
+        self.nonzero_ic_used_omega_rad_s = omega_n
+        self.nonzero_ic_robust_solution = robust_solution
+        self.nonzero_ic_profile_events = positive_profile_events
+        self.initial_velocity_mm_s = (
+            self.direction * positive_profile_events[0][1]
+        )
+        source_base = (
+            (
+                'nonzero_ic_adaptive_free_swing_amplitude_corrected'
+                if amplitude_correction is not None
+                else 'nonzero_ic_adaptive_free_swing'
+            )
+            if frequency_estimate is not None
+            else 'nonzero_ic_closed_form'
+        )
+        if robust_solution is not None:
+            source_base += (
+                f'_robust_band_{robust_solution.frequency_band_fraction:.4f}'
+            )
+        self.schedule = LockedSchedule(
+            source=source_base,
+            locked_at=0.0,
+            id_time=(
+                float('nan')
+                if frequency_estimate is None
+                else frequency_estimate.window_duration_s
+            ),
+            id_T=(
+                float('nan')
+                if frequency_estimate is None
+                else math.pi / frequency_estimate.omega_n_rad_s
+            ),
+            T=schedule_tail_s,
+            A0=schedule_amplitudes[0],
+            A1=schedule_amplitudes[1],
+            A2=schedule_amplitudes[2],
+            raw_id_zeta=0.0,
+            id_zeta=0.0,
+            shaper_zeta=0.0,
+            cond_b=float('nan'),
+        )
+        signed_profile_events = tuple(
+            (event_time_s, self.direction * velocity_mm_s)
+            for event_time_s, velocity_mm_s in positive_profile_events
+        )
+        switches = tuple(event[0] for event in signed_profile_events[1:])
+        levels = tuple(event[1] for event in signed_profile_events)
+        correction_log = (
+            ''
+            if amplitude_correction is None
+            else (
+                f'fit_amplitude_angle='
+                f'{math.degrees(amplitude_correction.amplitude_angle_rad):.3f}deg, '
+                f'omega_small_angle='
+                f'{amplitude_correction.small_angle_omega_rad_s:.6f}rad/s, '
+                f'nonlinear_factor='
+                f'{amplitude_correction.correction_factor:.8f}, '
+            )
+        )
+        robust_log = (
+            ''
+            if robust_solution is None
+            else (
+                f'robust_band=+/-{100.0 * robust_solution.frequency_band_fraction:.1f}%, '
+                f'start_weights={robust_solution.start_amplitudes}, '
+                f'stop_weights={robust_solution.stop_amplitudes}, '
+                f'impulse_times={robust_solution.impulse_times_s}s, '
+                f'band_worst={robust_solution.worst_case_residual_fraction:.4f}, '
+                f'two_impulse_band_worst='
+                f'{robust_solution.baseline_worst_case_residual_fraction:.4f}, '
+            )
+        )
+        self.get_logger().info(
+            'LOCKED robust nonzero-IC shaper at forward-only profile start: '
+            if robust_solution is not None else
+            'LOCKED nonzero-IC shaper at forward-only profile start: '
+        )
+        self.get_logger().info(
+            f'x0=[swing={world_swing_mm:.3f}mm, '
+            f'payload_v={world_payload_velocity_mm_s:.3f}mm/s] world-axis, '
+            f'omega_finite_fit={fitted_omega_n:.6f}rad/s, '
+            + correction_log
+            + f'omega_shaper={omega_n:.6f}rad/s '
+            f'(mode={shaper_frequency_mode}, '
+            f'scale={self.args.nonzero_ic_shaper_frequency_scale:.6f}), '
+            + robust_log
+            + f'tail={schedule_tail_s:.6f}s, '
+            f'state_prediction={1000.0 * state_prediction_age_s:.1f}ms'
+        )
+        if self.nonzero_ic_predicted_command_start_payload_velocity_mm_s is not None:
+            self.get_logger().info(
+                'Actuator-delay model states: '
+                f'command issued {self.args.timed_profile_actuation_lead_ms:.1f}ms '
+                'before the intended physical peak; '
+                f'predicted command-start payload_v='
+                f'{self.nonzero_ic_predicted_command_start_payload_velocity_mm_s:.3f}'
+                'mm/s, predicted physical-peak payload_v='
+                f'{world_payload_velocity_mm_s:.3f}mm/s'
+            )
+        self.get_logger().info(
+            'Nonzero-IC switches: '
+            + ', '.join(f'{value:.6f}s' for value in switches)
+            + ' | velocities: '
+            + ', '.join(f'{value:.3f}' for value in levels)
+            + ' mm/s | verified terminal residual: '
+            f'{terminal_position_residual_mm:.3e}mm, '
+            f'{terminal_velocity_residual_mm_s:.3e}mm/s'
+        )
+        return state_capture_wall
+
+    def _excite_axis_angle_deg(self) -> float | None:
+        return (
+            self.latest_enc_pitch_deg
+            if self.args.axis == 'x'
+            else self.latest_enc_roll_deg
+        )
+
+    def _excite_log_values(self) -> list:
+        """Nine trailing CSV fields describing the swing-up stage (blank-safe)."""
+        raw_angle = self._excite_axis_angle_deg()
+        cart_offset = (
+            ''
+            if self.latest_cart_q_mm is None or self.excite_start_cart_q_mm is None
+            else self.latest_cart_q_mm - self.excite_start_cart_q_mm
+        )
+        omega = '' if self.exciter is None else self.exciter.cfg.omega_rad_s
+        cmd = self._latest_excite_cmd
+        return [
+            '' if raw_angle is None else raw_angle,
+            self.excite_angle_bias_deg,
+            '' if cmd is None else cmd.amplitude_est_deg,
+            '' if cmd is None else cmd.peak_est_deg,
+            '' if cmd is None else cmd.angle_rate_deg_s,
+            '' if cmd is None else cmd.velocity_mm_s,
+            '' if self.exciter is None else self.exciter.drive_sign,
+            cart_offset,
+            omega,
+        ]
+
+    def _cart_within_workspace(self) -> bool:
+        cart_m = self._current_cart_axis_m(self.latest_gantry_state_sample)
+        if cart_m is None:
+            cart_m = self._current_cart_axis_m()
+        if cart_m is None:
+            return True
+        cart_mm = cart_m * 1000.0
+        low = self.args.workspace_min_mm + self.args.workspace_margin_mm
+        high = self.args.workspace_max_mm - self.args.workspace_margin_mm
+        return low <= cart_mm <= high
+
+    def _runtime_safety_reason(self, now: float) -> str | None:
+        """Return a reason to stop a live nonzero-IC run, or ``None``."""
+        state = self.latest_gantry_state_sample
+        if (
+            state is None
+            or now - state.rx_wall > self.args.gantry_fresh_timeout
+        ):
+            age_ms = (
+                float('inf') if state is None
+                else 1000.0 * max(0.0, now - state.rx_wall)
+            )
+            return (
+                'gantry state is stale during nonzero-IC execution: '
+                f'age={age_ms:.1f}ms, limit='
+                f'{1000.0 * self.args.gantry_fresh_timeout:.1f}ms'
+            )
+        if (
+            self.args.require_encoder_health
+            and not self._encoder_health_ready(now)
+        ):
+            return 'encoder diagnostics are missing, stale, or unhealthy'
+
+        cart_mm = 1000.0 * float(
+            state.x if self.args.axis == 'x' else state.y
+        )
+        low = self.args.workspace_min_mm + self.args.workspace_margin_mm
+        high = self.args.workspace_max_mm - self.args.workspace_margin_mm
+        if not (low <= cart_mm <= high):
+            return (
+                f'cart left the configured workspace margin: position='
+                f'{cart_mm:.1f}mm allowed=[{low:.1f}, {high:.1f}]mm'
+            )
+
+        if self.phase == 'maneuver' and self.start_cart_q_mm is not None:
+            traveled_mm = self.direction * (cart_mm - self.start_cart_q_mm)
+            if traveled_mm > self.args.max_travel_mm:
+                return (
+                    f'actual travel {traveled_mm:.1f}mm exceeded '
+                    f'--max-travel-mm={self.args.max_travel_mm:.1f}mm'
+                )
+        return None
+
+    def _abort_excite(self, now: float, reason: str) -> None:
+        # Anchor wall_start so the main loop's abort handling collects residual
+        # and finishes the run instead of looping in the excite branch.
+        self.wall_start = now
+        self.phase = 'residual'
+        self._abort_without_estimate(0.0, reason=reason)
+
+    def _run_excite_phase(self, now: float) -> None:
+        """One control tick of the closed-loop swing-up stage."""
+        angle_raw = self._excite_axis_angle_deg()
+        enc_fresh = (
+            self.latest_enc_wall is not None
+            and now - self.latest_enc_wall <= self.args.payload_fresh_timeout
+        )
+        if angle_raw is None or not enc_fresh or not math.isfinite(angle_raw):
+            self._publish_stream(0.0, 0.0)
+            if now - self._last_excite_wait_log_wall >= 1.0:
+                self._last_excite_wait_log_wall = now
+                self.get_logger().warn(
+                    'Excite: holding zero; waiting for a fresh '
+                    f'/payload/pose_e {self.args.axis} angle')
+            return
+
+        if not self._cart_within_workspace():
+            self._abort_excite(
+                now, reason='cart left the configured workspace during excitation')
+            return
+
+        cart_offset_mm = (
+            0.0
+            if self.latest_cart_q_mm is None or self.excite_start_cart_q_mm is None
+            else self.latest_cart_q_mm - self.excite_start_cart_q_mm
+        )
+        if abs(cart_offset_mm) > 1.5 * self.args.excite_travel_budget_mm:
+            self._abort_excite(
+                now,
+                reason=(
+                    f'excitation cart offset {cart_offset_mm:.0f}mm exceeded '
+                    f'1.5x the travel budget'))
+            return
+
+        angle_deg = angle_raw - self.excite_angle_bias_deg
+        cmd = self.exciter.update(now, angle_deg, cart_offset_mm)
+        self._latest_excite_cmd = cmd
+
+        if cmd.abort_reason is not None:
+            self._abort_excite(now, reason=f'excitation aborted: {cmd.abort_reason}')
+            return
+
+        if cmd.converged:
+            if getattr(self.args, 'excite_only', False):
+                self.excite_only_complete = True
+                self.wall_start = now
+                self.final_zero_wall = now
+                self.phase = 'residual'
+                self._publish_stream(0.0, 0.0)
+                self._log_row(0.0, 0.0, 0.0)
+                self.get_logger().info(
+                    'Bounded excitation-only trial returned to its anchor; '
+                    f'collecting residual swing for {self.args.residual_window:.1f}s. '
+                    'The nonzero-IC travel maneuver will not run.')
+                return
+            self.phase = 'id_hold'
+            self.id_hold_start_wall = now
+            self._publish_stream(0.0, 0.0)
+            self._log_row(-(now - self.run_start_wall), 0.0, 0.0)
+            self.get_logger().info(
+                f'Bounded swing-up converged and returned to its anchor: '
+                f'|theta|~{cmd.amplitude_est_deg:.2f}deg '
+                f'(target {self.args.excite_target_angle_deg:.1f}deg, '
+                f'cart offset={cart_offset_mm:+.2f}mm). Holding zero for '
+                f'{self.args.tau:.1f}s of stationary-trolley ID.')
+            return
+
+        vx, vy = (
+            (cmd.velocity_mm_s, 0.0)
+            if self.args.axis == 'x'
+            else (0.0, cmd.velocity_mm_s)
+        )
+        self._publish_stream(vx, vy)
+        self._log_row(-(now - self.run_start_wall), vx, vy)
+
+    def _next_positive_peak_wall(
+        self,
+        estimate: FreeSwingFrequencyEstimate,
+        earliest_wall: float,
+    ) -> float:
+        """Map the first fitted positive peak after ``earliest_wall`` to wall time."""
+        if self.payload_clock_offset_s is None:
+            raise NonzeroIcNotReady(
+                'payload clock is not calibrated for timed start')
+        omega = estimate.omega_n_rad_s
+        period = 2.0 * math.pi / omega
+        positive_peak_phase = math.atan2(
+            estimate.sine_coefficient_mm,
+            estimate.cosine_coefficient_mm,
+        )
+        # The shaper's "positive" initial swing is positive in the direction
+        # of travel, not necessarily positive in world coordinates.  A
+        # negative-axis maneuver therefore starts at the fitted negative
+        # world-axis peak, one half-period after the positive-world peak.
+        if self.direction < 0.0:
+            positive_peak_phase += math.pi
+        base_peak_payload_time = (
+            estimate.reference_time_s + positive_peak_phase / omega
+        )
+        earliest_payload_time = payload_time_at_wall(
+            earliest_wall,
+            self.payload_clock_offset_s,
+        )
+        cycles = math.ceil(
+            (earliest_payload_time - base_peak_payload_time) / period
+            - 1.0e-12
+        )
+        peak_payload_time = base_peak_payload_time + max(0, cycles) * period
+        while peak_payload_time < earliest_payload_time - 1.0e-9:
+            peak_payload_time += period
+        return payload_wall_at_time(
+            peak_payload_time,
+            self.payload_clock_offset_s,
+        )
+
+    def _arm_controller_timed_profile(
+        self,
+        start_wall: float,
+        fitted_peak_wall: float,
+    ) -> None:
+        if self.schedule is None:
+            raise ValueError('cannot arm controller timing without a locked schedule')
+        if not self.timed_profile_cli.service_is_ready():
+            raise NonzeroIcNotReady('/gantry/execute_timed_profile is not available')
+
+        schedule = self.schedule
+        if self.nonzero_ic_profile_events is not None:
+            raw_events = tuple(
+                (event_time_s, self.direction * velocity_mm_s)
+                for event_time_s, velocity_mm_s
+                in self.nonzero_ic_profile_events
+            )
+        else:
+            levels = (
+                self.direction * schedule.A0 * self.vmax_abs_mm_s,
+                self.direction * self.vmax_abs_mm_s,
+                self.direction * schedule.A1 * self.vmax_abs_mm_s,
+                0.0,
+            )
+            raw_events = (
+                (0.0, levels[0]),
+                (schedule.T, levels[1]),
+                (self.tf, levels[2]),
+                (self.tf + schedule.T, levels[3]),
+            )
+        events: list[tuple[float, float]] = []
+        for event_time, velocity in raw_events:
+            if events and math.isclose(
+                event_time, events[-1][0], rel_tol=0.0, abs_tol=1.0e-10
+            ):
+                events[-1] = (event_time, velocity)
+            else:
+                events.append((event_time, velocity))
+
+        lead_s = start_wall - time.monotonic()
+        if lead_s < 0.10:
+            raise NonzeroIcNotReady(
+                f'controller-timed start lead shrank to {lead_s:.3f}s'
+            )
+        start_ros_ns = self.get_clock().now().nanoseconds + int(lead_s * 1.0e9)
+        request = ExecuteTimedProfile.Request()
+        request.start_time.sec = int(start_ros_ns // 1_000_000_000)
+        request.start_time.nanosec = int(start_ros_ns % 1_000_000_000)
+        request.time_s = [float(event[0]) for event in events]
+        if self.args.axis == 'x':
+            request.vx_mm_s = [float(event[1]) for event in events]
+            request.vy_mm_s = [0.0] * len(events)
+        else:
+            request.vx_mm_s = [0.0] * len(events)
+            request.vy_mm_s = [float(event[1]) for event in events]
+        self.timed_profile_start_wall = start_wall
+        self.timed_profile_peak_wall = fitted_peak_wall
+        self.timed_profile_payload_clock_offset_s = self.payload_clock_offset_s
+        self.timed_profile_arm_payload_queue_delay_ms = (
+            self.latest_payload_queue_delay_ms
+        )
+        if self.timed_profile_payload_clock_offset_s is not None:
+            self.timed_profile_peak_payload_time = payload_time_at_wall(
+                fitted_peak_wall,
+                self.timed_profile_payload_clock_offset_s,
+            )
+            self.timed_profile_start_payload_time = payload_time_at_wall(
+                start_wall,
+                self.timed_profile_payload_clock_offset_s,
+            )
+        else:
+            self.timed_profile_peak_payload_time = None
+            self.timed_profile_start_payload_time = None
+        self.nonzero_ic_measured_command_start = None
+        self.nonzero_ic_measured_peak = None
+        self.timed_profile_request_wall = time.monotonic()
+        self.timed_profile_future = self.timed_profile_cli.call_async(request)
+        self.phase = 'arm_profile'
+
+    def _poll_controller_timed_profile(self) -> bool:
+        future = self.timed_profile_future
+        if future is None:
+            return False
+        if not future.done():
+            start_wall = self.timed_profile_start_wall
+            if (
+                start_wall is not None
+                and time.monotonic() >= start_wall - 0.05
+            ):
+                raise ValueError(
+                    'controller did not acknowledge the timed profile before '
+                    'its scheduled start')
+            return False
+        self.timed_profile_future = None
+        try:
+            result = future.result()
+        except Exception as exc:
+            raise ValueError(f'controller-timed profile service failed: {exc}') from exc
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            raise ValueError(f'controller rejected timed profile: {message}')
+        if self.timed_profile_start_wall is None:
+            raise ValueError('controller accepted a timed profile without a start epoch')
+        self.wall_start = self.timed_profile_start_wall
+        self.start_cart_q_mm = self.latest_cart_q_mm
+        self.final_zero_wall = None
+        self.residual_samples.clear()
+        self.controller_timed_profile_active = True
+        self.phase = 'armed_profile'
+        self.get_logger().info(
+            'Controller accepted the nonzero-IC schedule; holding zero until '
+            'the actuator-compensated profile start epoch')
+        return True
+
+    def _maybe_begin_nonzero_ic_profile(self, now: float) -> bool:
+        """Start at the first live state with a forward-only valid solution."""
+        if self.args.excite and self.phase != 'wait_peak':
+            return False
+        if (
+            self.latest_payload_wall is None
+            or now - self.latest_payload_wall > self.args.payload_fresh_timeout
+        ):
+            reason = 'payload state is not fresh'
+        elif (
+            getattr(self.args, 'controller_timed_profile', False)
+            and (
+                self.latest_payload_queue_delay_ms is None
+                or self.latest_payload_queue_delay_ms
+                > self.args.nonzero_ic_max_payload_queue_delay_ms
+            )
+        ):
+            delay_text = (
+                'unavailable'
+                if self.latest_payload_queue_delay_ms is None
+                else f'{self.latest_payload_queue_delay_ms:.2f}ms'
+            )
+            reason = (
+                'payload sample waited in the callback queue: '
+                f'delay={delay_text}, maximum='
+                f'{self.args.nonzero_ic_max_payload_queue_delay_ms:.2f}ms'
+            )
+        else:
+            try:
+                if getattr(self.args, 'controller_timed_profile', False):
+                    estimate = self._update_nonzero_ic_frequency_estimate()
+                    actuation_lead_s = (
+                        1.0e-3 * self.args.timed_profile_actuation_lead_ms
+                    )
+                    fitted_peak_wall = self._next_positive_peak_wall(
+                        estimate,
+                        now + self.args.timed_profile_lead_s + actuation_lead_s,
+                    )
+                    self._configure_nonzero_ic_schedule(
+                        state_capture_wall_override=fitted_peak_wall)
+                    profile_start_wall = actuator_compensated_profile_start(
+                        fitted_peak_wall,
+                        self.args.timed_profile_actuation_lead_ms,
+                    )
+                    self._arm_controller_timed_profile(
+                        profile_start_wall,
+                        fitted_peak_wall,
+                    )
+                    self.get_logger().info(
+                        'Locked nonzero-IC schedule for controller-owned '
+                        f'profile start in {profile_start_wall - now:.3f}s, '
+                        f'{self.args.timed_profile_actuation_lead_ms:.1f}ms '
+                        'before the fitted positive payload peak; '
+                        f'payload queue delay='
+                        f'{self.latest_payload_queue_delay_ms:.2f}ms')
+                    return False
+                state_capture_wall = self._configure_nonzero_ic_schedule()
+            except NonzeroIcNotReady as exc:
+                reason = str(exc)
+            except ValueError as exc:
+                self.wall_start = now
+                self._abort_without_estimate(
+                    0.0,
+                    reason=f'Cannot execute nonzero-IC profile safely: {exc}',
+                )
+                return False
+            else:
+                # The schedule represents the projected payload state at
+                # state_capture_wall, not the timer callback's stale `now`
+                # captured before the frequency fit.  Starting from the stale
+                # timestamp shortened the first velocity interval by the fit
+                # latency (85 ms / 30 mm in the 2026-08-27 run).
+                self.wall_start = state_capture_wall
+                self.start_cart_q_mm = self.latest_cart_q_mm
+                self.final_zero_wall = None
+                self.residual_samples.clear()
+                self.get_logger().info(
+                    'Forward-only initial condition is ready; beginning the '
+                    'nonzero-IC velocity profile now')
+                return True
+
+        if now - self._last_nonzero_ic_wait_log_wall >= 1.0:
+            self._last_nonzero_ic_wait_reason = reason
+            self._last_nonzero_ic_wait_log_wall = now
+            self.get_logger().info(
+                f'Holding zero; waiting for forward-only initial condition: {reason}')
+        return False
+
+    def _standard_zv_amplitudes(self, zeta: float) -> tuple[float, float, float]:
+        z = max(0.0, min(float(zeta), 0.99))
+        wd_factor = math.sqrt(max(1.0 - z * z, 1.0e-12))
+        decay = math.exp(-math.pi * z / wd_factor)
+        denom = 1.0 + decay
+        return 1.0 / denom, decay / denom, 0.0
 
     def _standard_zvd_amplitudes(self, zeta: float) -> tuple[float, float, float]:
         z = max(0.0, min(float(zeta), 0.99))
@@ -1343,13 +3488,99 @@ class AdaptivePaperTdfPlayer(Node):
         if not self.start_requested and not self.motion_started:
             return
         now = time.monotonic()
+        if self._last_stream_wall is not None:
+            self.latest_stream_dt_ms = 1000.0 * max(0.0, now - self._last_stream_wall)
+        self._last_stream_wall = now
+        if (
+            self.args.profile == 'nonzero-ic'
+            and self.motion_started
+            and not self.aborted
+            and self.phase in (
+                'excite', 'id_hold', 'wait_peak', 'arm_profile',
+                'armed_profile', 'maneuver')
+        ):
+            safety_reason = self._runtime_safety_reason(now)
+            if safety_reason is not None:
+                if self.wall_start is None:
+                    self.wall_start = now
+                self.phase = 'residual'
+                self._abort_without_estimate(
+                    0.0,
+                    reason=f'Runtime safety stop: {safety_reason}',
+                )
+                return
         if self.wall_start is None:
+            if not (self.args.profile == 'nonzero-ic' and self.motion_started):
+                self._publish_stream(0.0, 0.0)
+                return
+
+            if self.phase == 'excite':
+                self._run_excite_phase(now)
+                return
+
+            if self.phase == 'id_hold':
+                self._publish_stream(0.0, 0.0)
+                self._log_row(-(now - self.run_start_wall), 0.0, 0.0)
+                if now - self.id_hold_start_wall >= self.args.tau:
+                    self.phase = 'wait_peak'
+                    self.get_logger().info(
+                        f'Free-swing ID hold complete ({self.args.tau:.1f}s); '
+                        'waiting for a zero-velocity swing peak to start the '
+                        'shaped maneuver')
+                return
+
+            if self.phase == 'arm_profile':
+                self._publish_stream(0.0, 0.0)
+                self._log_row(-(now - self.run_start_wall), 0.0, 0.0)
+                try:
+                    self._poll_controller_timed_profile()
+                except ValueError as exc:
+                    self.wall_start = now
+                    self.phase = 'residual'
+                    self._abort_without_estimate(
+                        0.0, reason=f'Cannot arm controller timing safely: {exc}')
+                return
+
+            # phase == 'wait_peak' (also the entry phase without --excite)
             self._publish_stream(0.0, 0.0)
+            # Keep the CSV continuous while the trolley is stationary and the
+            # payload phase is being monitored.  Previously this branch
+            # returned without logging, so plots drew a false straight line
+            # across the missing wait-for-peak interval.
+            self._log_row(-(now - self.run_start_wall), 0.0, 0.0)
+            if not self._maybe_begin_nonzero_ic_profile(now):
+                return
+            self.phase = 'maneuver'
+            # Begin the first nonzero interval in this callback instead of
+            # losing another stream period before the initial command.
+            now = time.monotonic()
+
+        controller_timed_active = getattr(
+            self, 'controller_timed_profile_active', False)
+        if (
+            controller_timed_active
+            and self.phase == 'armed_profile'
+            and now < self.wall_start
+        ):
+            self._log_row(now - self.wall_start, 0.0, 0.0)
             return
+        if self.phase == 'armed_profile':
+            self.phase = 'maneuver'
 
         move_t = now - self.wall_start
-        if self.aborted:
+        if getattr(self, 'excite_only_complete', False):
             self._publish_stream(0.0, 0.0)
+            self._log_row(move_t, 0.0, 0.0)
+            if now - self.final_zero_wall >= self.args.residual_window:
+                self._finish_run()
+            return
+        if self.aborted:
+            if not controller_timed_active:
+                self._publish_stream(0.0, 0.0)
+            # Preserve the requested residual window for aborted runs too.
+            # Previously the node collected residual statistics but stopped
+            # writing CSV rows at the abort instant.
+            self._log_row(move_t, 0.0, 0.0)
             if now - self.final_zero_wall >= self.args.residual_window:
                 self._finish_run()
             return
@@ -1434,19 +3665,23 @@ class AdaptivePaperTdfPlayer(Node):
 
         vx_axis = self._axis_velocity_for_time(move_t)
         vx, vy = (vx_axis, 0.0) if self.args.axis == 'x' else (0.0, vx_axis)
-        self._publish_stream(vx, vy)
+        if not controller_timed_active:
+            self._publish_stream(vx, vy)
         self._log_row(move_t, vx, vy)
 
         end_t = self._end_time()
         if move_t >= end_t and self.final_zero_wall is None:
             self.final_zero_wall = now
-            self._publish_stream(0.0, 0.0)
+            self.phase = 'residual'
+            if not controller_timed_active:
+                self._publish_stream(0.0, 0.0)
             self.get_logger().info(
                 f'Paper TDF command is zero; collecting residual swing for '
                 f'{self.args.residual_window:.1f}s')
             return
         if self.final_zero_wall is not None:
-            self._publish_stream(0.0, 0.0)
+            if not controller_timed_active:
+                self._publish_stream(0.0, 0.0)
             if now - self.final_zero_wall >= self.args.residual_window:
                 self._finish_run()
         elif (
@@ -1500,12 +3735,20 @@ class AdaptivePaperTdfPlayer(Node):
     def _latest_active_estimate(self) -> Estimate | None:
         if self.args.id_method == 'paper2-step':
             return self.latest_paper2_estimate
+        if self.args.id_method == 'zero-zeta-ls':
+            return self.latest_zero_zeta_estimate
+        if self.args.id_method == 'freq-bank':
+            return self.latest_freq_bank_estimate
         return self.identifier.latest_valid
 
     def _select_colleague_lock_estimate(self, move_t: float) -> tuple[str, Estimate | None]:
         source_base = self.args.profile.replace('-', '_')
         if self.args.id_method == 'paper2-step':
             source_base += '_paper2_step'
+        elif self.args.id_method == 'zero-zeta-ls':
+            source_base += '_zero_zeta_ls'
+        elif self.args.id_method == 'freq-bank':
+            source_base += '_freq_bank'
         if self.args.profile != 'colleague-paper-closed':
             if self.best_estimate is not None:
                 return source_base + '_best_cond', self.best_estimate
@@ -1534,6 +3777,14 @@ class AdaptivePaperTdfPlayer(Node):
             if selected is not None:
                 return source, selected
             return source, None
+        if self.args.is2_selection_mode == 'latest':
+            selected = max(candidates, key=lambda est: est.t)
+            source = source_base + '_latest_T'
+            self.get_logger().info(
+                f'IS2 {source} selection: selected latest of {len(candidates)} '
+                f'valid estimates; selected_t={selected.t:.3f}s '
+                f'selected_T={selected.T:.4f}s condB={selected.cond_b:.3e}')
+            return source, selected
 
         source = source_base + '_median_T'
         if (
@@ -1650,7 +3901,13 @@ class AdaptivePaperTdfPlayer(Node):
             return
         self.aborted = True
         self.final_zero_wall = time.monotonic()
-        self._publish_stream(0.0, 0.0)
+        if (
+            getattr(self, 'controller_timed_profile_active', False)
+            or getattr(self, 'timed_profile_start_wall', None) is not None
+        ):
+            self._publish_traj_abort()
+        else:
+            self._publish_stream(0.0, 0.0)
         reason_text = (
             f'No adaptive estimate by {move_t:.3f}s and fallback disabled'
             if reason is None
@@ -1662,14 +3919,43 @@ class AdaptivePaperTdfPlayer(Node):
 
     def _axis_velocity_for_time(self, move_t: float) -> float:
         if self.args.profile == 'pulse':
-            return self.direction * self.vmax_abs_mm_s if move_t < self.tf else 0.0
+            pulse_t = move_t - self.args.pulse_pre_delay_s
+            return (
+                self.direction * self.vmax_abs_mm_s
+                if 0.0 <= pulse_t < self.tf
+                else 0.0
+            )
 
         sched = self.schedule
         if sched is None:
             return self.initial_velocity_mm_s
 
+        if (
+            self.args.profile == 'nonzero-ic'
+            and self.nonzero_ic_profile_events is not None
+        ):
+            velocity_mm_s = 0.0
+            for event_time_s, event_velocity_mm_s in self.nonzero_ic_profile_events:
+                if move_t < event_time_s:
+                    break
+                velocity_mm_s = event_velocity_mm_s
+            return self.direction * velocity_mm_s
+
         T = sched.T
         A0, A1 = sched.A0, sched.A1
+        if self.args.profile in ('zv', 'nonzero-ic'):
+            if move_t < T:
+                gain = A0
+            elif move_t < self.tf:
+                gain = 1.0
+            elif move_t < self.tf + T:
+                gain = 1.0 - A0
+            else:
+                gain = 0.0
+            if self.args.profile == 'nonzero-ic':
+                return self.direction * self.vmax_abs_mm_s * gain
+            return self.direction * self.vmax_abs_mm_s * max(0.0, gain)
+
         if self._is_colleague_profile():
             tau = self.args.tau
             if move_t < tau + T:
@@ -1720,7 +4006,10 @@ class AdaptivePaperTdfPlayer(Node):
 
     def _end_time(self) -> float:
         if self.args.profile == 'pulse':
-            return self.tf
+            return self.args.pulse_pre_delay_s + self.tf
+        if self.args.profile in ('zv', 'nonzero-ic'):
+            T = self.args.fallback_t if self.schedule is None else self.schedule.T
+            return self.tf + T
         if self._is_colleague_profile():
             T = self.args.fallback_t if self.schedule is None else self.schedule.T
             return self.tf + self.args.tau + 2.0 * T
@@ -1789,15 +4078,75 @@ class AdaptivePaperTdfPlayer(Node):
                 f'last t={last.t:.3f}s T={last.T:.4f}s; {chosen_text}'
             )
 
-        if self.args.profile == 'pulse':
+        if self.excite_only_complete:
+            status = 'Bounded excitation-only trial complete'
+        elif self.args.profile == 'pulse':
             status = 'Pulse baseline move complete'
         else:
             status = 'Paper TDF move aborted' if self.aborted else 'Paper TDF move complete'
+        excite_text = ''
+        if self.exciter is not None and self._latest_excite_cmd is not None:
+            cmd = self._latest_excite_cmd
+            excite_text = (
+                f' | excite: A_est={cmd.amplitude_est_deg:.1f}deg '
+                f'(target {self.args.excite_target_angle_deg:.1f}deg) '
+                f'drive_sign={cmd.drive_sign:+.0f}'
+            )
+        if self.excite_only_complete:
+            anchor_error = (
+                float('nan')
+                if self.latest_cart_q_mm is None or self.excite_start_cart_q_mm is None
+                else self.latest_cart_q_mm - self.excite_start_cart_q_mm
+            )
+            travel_text = f'excitation anchor return error={anchor_error:+.2f} mm'
+        else:
+            travel_text = (
+                f'travel: target={self.args.target_distance_mm:.1f} mm '
+                f'actual={traveled:.1f} mm error={target_error:+.1f} mm')
         self.get_logger().info(
-            f'{status} | '
-            f'travel: target={self.args.target_distance_mm:.1f} mm '
-            f'actual={traveled:.1f} mm error={target_error:+.1f} mm | '
-            f'{sample_text} | {estimate_text}{id_text}')
+            f'{status} | {travel_text} | '
+            f'{sample_text} | {estimate_text}{id_text}{excite_text}')
+        if self.args.profile == 'nonzero-ic':
+            if self.timed_profile_payload_clock_offset_s is not None:
+                arm_queue_text = (
+                    'unavailable'
+                    if self.timed_profile_arm_payload_queue_delay_ms is None
+                    else (
+                        f'{self.timed_profile_arm_payload_queue_delay_ms:.2f}ms'
+                    )
+                )
+                self.get_logger().info(
+                    'Payload timing diagnostics: calibrated clock offset='
+                    f'{self.timed_profile_payload_clock_offset_s:.6f}s, '
+                    f'queue delay at arming={arm_queue_text}, gate='
+                    f'{self.args.nonzero_ic_max_payload_queue_delay_ms:.2f}ms')
+            command_observation = self.nonzero_ic_measured_command_start
+            peak_observation = self.nonzero_ic_measured_peak
+            if command_observation is not None or peak_observation is not None:
+                command_text = (
+                    'unavailable'
+                    if command_observation is None
+                    else (
+                        f'v={command_observation.world_payload_velocity_mm_s:+.2f}'
+                        f'mm/s sample_dt={command_observation.offset_ms:+.2f}ms'
+                    )
+                )
+                peak_text = (
+                    'unavailable'
+                    if peak_observation is None
+                    else (
+                        f'v={peak_observation.world_payload_velocity_mm_s:+.2f}'
+                        f'mm/s sample_dt={peak_observation.offset_ms:+.2f}ms'
+                    )
+                )
+                self.get_logger().info(
+                    'Peak-state diagnostics (measured velocity is filtered '
+                    'encoder-relative velocity plus measured cart velocity): '
+                    f'predicted_peak_v='
+                    f'{self.nonzero_ic_predicted_peak_payload_velocity_mm_s:+.3f}'
+                    f'mm/s | measured_near_command_start={command_text} | '
+                    f'measured_near_intended_physical_peak={peak_text}'
+                )
 
     def _finish_run(self):
         if self.done:
@@ -1806,7 +4155,7 @@ class AdaptivePaperTdfPlayer(Node):
         self._print_final_report()
         if self.csv_file is not None:
             self.csv_file.flush()
-        rclpy.try_shutdown()
+            self._generate_run_outputs()
 
     def _publish_stream(self, vx_mm_s: float, vy_mm_s: float):
         msg = TrajCmd()
@@ -1819,13 +4168,48 @@ class AdaptivePaperTdfPlayer(Node):
             msg.y = float(self.latest_gantry_state.y)
         self.traj_pub.publish(msg)
 
+    def _publish_traj_abort(self):
+        msg = TrajCmd()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.command = TrajCmd.ABORT
+        self.traj_pub.publish(msg)
+
     def _log_row(self, move_t: float, vx: float, vy: float):
         if self.csv_writer is None:
             return
+        log_wall = time.monotonic()
         latest = self._latest_active_estimate()
+        logged_omega_n = (
+            latest.omega_n
+            if latest is not None
+            else self.nonzero_ic_used_omega_rad_s
+        )
+        nonzero_fit = self.nonzero_ic_frequency_estimate
         candidate = self.identifier.latest_candidate
         sched = self.schedule
+        robust = self.nonzero_ic_robust_solution
         source = 'pulse' if self.args.profile == 'pulse' else ('' if sched is None else sched.source)
+        cart_sample = self.latest_cart_state_sample or self.latest_gantry_state_sample
+        state_age_ms = (
+            ''
+            if self.latest_gantry_state_sample is None
+            else 1000.0 * max(0.0, log_wall - self.latest_gantry_state_sample.rx_wall)
+        )
+        payload_age_ms = (
+            ''
+            if self.latest_payload_wall is None
+            else 1000.0 * max(0.0, log_wall - self.latest_payload_wall)
+        )
+        latency_values = (
+            [''] * 26
+            if self.latest_traj_latency is None
+            else self.latest_traj_latency
+        )
+        latency_age_ms = (
+            ''
+            if self.latest_traj_latency_wall is None
+            else 1000.0 * max(0.0, log_wall - self.latest_traj_latency_wall)
+        )
         self.csv_writer.writerow([
             self.get_clock().now().nanoseconds * 1.0e-9,
             move_t,
@@ -1833,11 +4217,221 @@ class AdaptivePaperTdfPlayer(Node):
             vy,
             '' if self.latest_payload_abs_mm is None else self.latest_payload_abs_mm,
             '' if self.latest_swing_mm is None else self.latest_swing_mm,
+            '' if self.latest_enc_pitch_deg is None else self.latest_enc_pitch_deg,
+            '' if self.latest_enc_roll_deg is None else self.latest_enc_roll_deg,
+            (
+                ''
+                if (self.latest_enc_pitch_deg is None and self.args.axis == 'x') or
+                (self.latest_enc_roll_deg is None and self.args.axis == 'y')
+                else (
+                    self.latest_enc_pitch_deg
+                    if self.args.axis == 'x'
+                    else self.latest_enc_roll_deg
+                )
+            ),
             '' if self.latest_id_filtered_swing_mm is None else self.latest_id_filtered_swing_mm,
             '' if self.latest_cart_q_mm is None else self.latest_cart_q_mm,
+            (
+                ''
+                if cart_sample is None
+                else 1000.0 * float(cart_sample.vx)
+            ),
+            (
+                ''
+                if cart_sample is None
+                else 1000.0 * float(cart_sample.vy)
+            ),
+            '' if cart_sample is None else cart_sample.stamp,
+            state_age_ms,
+            '' if self.latest_payload_time is None else self.latest_payload_time,
+            payload_age_ms,
+            (
+                ''
+                if self.latest_payload_observed_clock_offset_s is None
+                else self.latest_payload_observed_clock_offset_s
+            ),
+            (
+                ''
+                if self.payload_clock_offset_s is None
+                else self.payload_clock_offset_s
+            ),
+            (
+                ''
+                if self.latest_payload_queue_delay_ms is None
+                else self.latest_payload_queue_delay_ms
+            ),
+            (
+                ''
+                if self.latest_payload_encoder_sample_age_ms is None
+                else self.latest_payload_encoder_sample_age_ms
+            ),
+            (
+                ''
+                if self.latest_payload_rel_vx_mm_s is None
+                else self.latest_payload_rel_vx_mm_s
+            ),
+            (
+                ''
+                if self.latest_payload_rel_raw_vx_mm_s is None
+                else self.latest_payload_rel_raw_vx_mm_s
+            ),
+            '' if self.latest_stream_dt_ms is None else self.latest_stream_dt_ms,
             self._traveled_target_distance_mm(),
             '' if latest is None else latest.cond_b,
-            '' if latest is None else latest.omega_n,
+            '' if logged_omega_n is None else logged_omega_n,
+            (
+                ''
+                if self.nonzero_ic_fitted_omega_rad_s is None
+                else self.nonzero_ic_fitted_omega_rad_s
+            ),
+            (
+                ''
+                if self.nonzero_ic_small_angle_omega_rad_s is None
+                else self.nonzero_ic_small_angle_omega_rad_s
+            ),
+            (
+                ''
+                if self.nonzero_ic_fitted_amplitude_angle_deg is None
+                else self.nonzero_ic_fitted_amplitude_angle_deg
+            ),
+            (
+                ''
+                if self.nonzero_ic_frequency_correction_factor is None
+                else self.nonzero_ic_frequency_correction_factor
+            ),
+            (
+                ''
+                if self.nonzero_ic_used_omega_rad_s is None
+                else self.nonzero_ic_used_omega_rad_s
+            ),
+            (
+                ''
+                if self.args.profile != 'nonzero-ic'
+                else self.args.nonzero_ic_shaper_frequency_scale
+            ),
+            (
+                ''
+                if self.args.profile != 'nonzero-ic'
+                else (
+                    'fixed'
+                    if self.args.nonzero_ic_shaper_omega_rad_s > 0.0
+                    else (
+                        'amplitude-corrected-scaled-fit'
+                        if self.args.nonzero_ic_finite_amplitude_correction
+                        else 'scaled-fit'
+                    )
+                )
+            ),
+            (
+                ''
+                if self.args.profile != 'nonzero-ic'
+                else self.args.nonzero_ic_shaper_omega_rad_s
+            ),
+            int(robust is not None),
+            '' if robust is None else robust.frequency_band_fraction,
+            (
+                '' if robust is None else ';'.join(
+                    f'{value:.12g}' for value in robust.impulse_times_s)
+            ),
+            (
+                '' if robust is None else ';'.join(
+                    f'{value:.12g}' for value in robust.start_amplitudes)
+            ),
+            (
+                '' if robust is None else ';'.join(
+                    f'{value:.12g}' for value in robust.stop_amplitudes)
+            ),
+            '' if robust is None else robust.worst_case_residual_fraction,
+            (
+                '' if robust is None
+                else robust.baseline_worst_case_residual_fraction
+            ),
+            '' if robust is None else robust.optimizer_iterations,
+            (
+                ''
+                if self.args.profile != 'nonzero-ic'
+                else self.args.timed_profile_actuation_lead_ms
+            ),
+            (
+                ''
+                if self.timed_profile_peak_wall is None
+                else self.timed_profile_peak_wall
+            ),
+            (
+                ''
+                if self.timed_profile_start_wall is None
+                else self.timed_profile_start_wall
+            ),
+            (
+                ''
+                if self.timed_profile_peak_payload_time is None
+                else self.timed_profile_peak_payload_time
+            ),
+            (
+                ''
+                if self.timed_profile_start_payload_time is None
+                else self.timed_profile_start_payload_time
+            ),
+            (
+                ''
+                if self.timed_profile_payload_clock_offset_s is None
+                else self.timed_profile_payload_clock_offset_s
+            ),
+            (
+                ''
+                if self.timed_profile_arm_payload_queue_delay_ms is None
+                else self.timed_profile_arm_payload_queue_delay_ms
+            ),
+            (
+                ''
+                if self.nonzero_ic_predicted_peak_swing_mm is None
+                else self.nonzero_ic_predicted_peak_swing_mm
+            ),
+            (
+                ''
+                if self.nonzero_ic_predicted_peak_payload_velocity_mm_s is None
+                else self.nonzero_ic_predicted_peak_payload_velocity_mm_s
+            ),
+            (
+                ''
+                if self.nonzero_ic_predicted_command_start_swing_mm is None
+                else self.nonzero_ic_predicted_command_start_swing_mm
+            ),
+            (
+                ''
+                if self.nonzero_ic_predicted_command_start_payload_velocity_mm_s is None
+                else self.nonzero_ic_predicted_command_start_payload_velocity_mm_s
+            ),
+            (
+                ''
+                if self.nonzero_ic_measured_command_start is None
+                else self.nonzero_ic_measured_command_start.swing_mm
+            ),
+            (
+                ''
+                if self.nonzero_ic_measured_command_start is None
+                else self.nonzero_ic_measured_command_start.world_payload_velocity_mm_s
+            ),
+            (
+                ''
+                if self.nonzero_ic_measured_command_start is None
+                else self.nonzero_ic_measured_command_start.offset_ms
+            ),
+            (
+                ''
+                if self.nonzero_ic_measured_peak is None
+                else self.nonzero_ic_measured_peak.swing_mm
+            ),
+            (
+                ''
+                if self.nonzero_ic_measured_peak is None
+                else self.nonzero_ic_measured_peak.world_payload_velocity_mm_s
+            ),
+            (
+                ''
+                if self.nonzero_ic_measured_peak is None
+                else self.nonzero_ic_measured_peak.offset_ms
+            ),
             '' if latest is None else latest.zeta,
             '' if latest is None else latest.T,
             '' if sched is None else sched.A0,
@@ -1848,6 +4442,21 @@ class AdaptivePaperTdfPlayer(Node):
             '' if sched is None else sched.id_time,
             '' if sched is None else sched.id_T,
             '' if sched is None else sched.T,
+            (
+                ''
+                if self.nonzero_ic_initial_swing_mm is None
+                else self.nonzero_ic_initial_swing_mm
+            ),
+            (
+                ''
+                if self.nonzero_ic_initial_payload_velocity_mm_s is None
+                else self.nonzero_ic_initial_payload_velocity_mm_s
+            ),
+            '' if nonzero_fit is None else nonzero_fit.amplitude_mm,
+            '' if nonzero_fit is None else nonzero_fit.rmse_mm,
+            '' if nonzero_fit is None else nonzero_fit.normalized_rmse,
+            '' if nonzero_fit is None else nonzero_fit.sample_count,
+            '' if nonzero_fit is None else nonzero_fit.window_duration_s,
             '' if candidate is None else candidate.t,
             '' if candidate is None else candidate.cond_b,
             '' if candidate is None else candidate.omega_n,
@@ -1855,13 +4464,19 @@ class AdaptivePaperTdfPlayer(Node):
             '' if candidate is None else candidate.T,
             '' if candidate is None else int(candidate.valid),
             '' if candidate is None else candidate.reject_reason,
+            self.args.eq21_input_model,
+            '' if self.latest_zero_zeta_estimate is None else self.latest_zero_zeta_estimate.T,
+            '' if self.latest_zero_zeta_score is None else self.latest_zero_zeta_score,
+            '' if self.latest_zero_zeta_rmse is None else self.latest_zero_zeta_rmse,
+            '' if self.latest_zero_zeta_amp is None else self.latest_zero_zeta_amp,
+            self.args.final_id_source,
+            self.args.tau,
+            abs(self.initial_velocity_mm_s),
             '' if self.latest_two_mode_t2 is None else self.latest_two_mode_t2,
             '' if self.latest_two_mode_amp1 is None else self.latest_two_mode_amp1,
             '' if self.latest_two_mode_amp2 is None else self.latest_two_mode_amp2,
             '' if self.latest_two_mode_amp_ratio is None else self.latest_two_mode_amp_ratio,
             '' if self.latest_two_mode_nrmse is None else self.latest_two_mode_nrmse,
-            '' if self.latest_enc_pitch_deg is None else self.latest_enc_pitch_deg,
-            '' if self.latest_enc_roll_deg is None else self.latest_enc_roll_deg,
             '' if self.latest_enc_pitch_count is None else self.latest_enc_pitch_count,
             '' if self.latest_enc_roll_count is None else self.latest_enc_roll_count,
             '' if self.latest_payload_rel_x_mm is None else self.latest_payload_rel_x_mm,
@@ -1870,9 +4485,40 @@ class AdaptivePaperTdfPlayer(Node):
             '' if self.latest_enc_arduino_ms is None else self.latest_enc_arduino_ms,
             '' if self.latest_enc_pitch_raw is None else self.latest_enc_pitch_raw,
             '' if self.latest_enc_roll_raw is None else self.latest_enc_roll_raw,
+            '' if self.latest_enc_imu1_ax is None else self.latest_enc_imu1_ax,
+            '' if self.latest_enc_imu1_ay is None else self.latest_enc_imu1_ay,
+            '' if self.latest_enc_imu1_az is None else self.latest_enc_imu1_az,
+            '' if self.latest_enc_imu1_gx is None else self.latest_enc_imu1_gx,
+            '' if self.latest_enc_imu1_gy is None else self.latest_enc_imu1_gy,
+            '' if self.latest_enc_imu1_gz is None else self.latest_enc_imu1_gz,
+            '' if self.latest_enc_imu2_ax is None else self.latest_enc_imu2_ax,
+            '' if self.latest_enc_imu2_ay is None else self.latest_enc_imu2_ay,
+            '' if self.latest_enc_imu2_az is None else self.latest_enc_imu2_az,
+            '' if self.latest_enc_imu2_gx is None else self.latest_enc_imu2_gx,
+            '' if self.latest_enc_imu2_gy is None else self.latest_enc_imu2_gy,
+            '' if self.latest_enc_imu2_gz is None else self.latest_enc_imu2_gz,
+            '' if self.latest_enc_packet_age_ms is None else self.latest_enc_packet_age_ms,
+            '' if self.latest_enc_packet_seen is None else self.latest_enc_packet_seen,
             '' if self.latest_enc_serial_lines is None else self.latest_enc_serial_lines,
             '' if self.latest_enc_parse_errors is None else self.latest_enc_parse_errors,
             '' if self.latest_enc_stale is None else self.latest_enc_stale,
+            '' if self.latest_cam_gantry_x_mm is None else self.latest_cam_gantry_x_mm,
+            (
+                ''
+                if self.latest_cam_gantry_x_mm is None or cart_sample is None
+                else self.latest_cam_gantry_x_mm - 1000.0 * float(cart_sample.x)
+            ),
+            '' if self.latest_cam_gantry_y_mm is None else self.latest_cam_gantry_y_mm,
+            (
+                ''
+                if self.latest_cam_gantry_y_mm is None or cart_sample is None
+                else self.latest_cam_gantry_y_mm - 1000.0 * float(cart_sample.y)
+            ),
+            *latency_values,
+            latency_age_ms,
+            self.phase,
+            '' if self.run_start_wall is None else log_wall - self.run_start_wall,
+            *self._excite_log_values(),
         ])
         if self.csv_file is not None:
             self._log_flush_count += 1
@@ -1892,17 +4538,43 @@ def parse_args():
             'colleague-moving',
             'colleague-velocity-exact',
             'colleague-paper-closed',
+            'zv',
             'robust',
+            'nonzero-ic',
         ])
     parser.add_argument('--payload-topic', default='/payload/pose_e_rel')
     parser.add_argument('--target-distance-mm', type=float, default=600.0)
     parser.add_argument('--vmax-mm-s', type=float, default=200.0)
+    parser.add_argument(
+        '--pulse-pre-delay-s',
+        type=float,
+        default=0.0,
+        help=(
+            'For --profile pulse: hold STREAM at zero for this duration after '
+            'MOTION_START before applying the velocity step.'
+        ),
+    )
     parser.add_argument('--a0', type=float, default=0.5)
     parser.add_argument(
         '--tau',
         type=float,
-        default=0.75,
-        help='For colleague profiles: timing offset used in the closed-form IS profile.')
+        default=None,
+        help=(
+            'For colleague profiles: closed-form timing offset. For '
+            '--profile nonzero-ic: telemetry-ready countdown and adaptive '
+            'free-swing observation window (default: 5.0s for nonzero-ic, '
+            '0.75s otherwise).'
+        ))
+    parser.add_argument(
+        '--id-duration-s',
+        type=float,
+        default=0.0,
+        help='Alias for --tau for fixed-duration ID tests. <=0 disables alias.')
+    parser.add_argument(
+        '--id-speed-mm-s',
+        type=float,
+        default=0.0,
+        help='Alias for --a0 using id_speed/vmax for fixed-speed ID tests. <=0 disables alias.')
     parser.add_argument(
         '--id-lock-mode',
         choices=['first', 'best-cond'],
@@ -1916,9 +4588,19 @@ def parse_args():
         help='Duration of valid ID estimates to include in first/last ID reporting.')
     parser.add_argument(
         '--id-method',
-        choices=('integral', 'paper2-step'),
+        choices=('integral', 'paper2-step', 'zero-zeta-ls', 'freq-bank'),
         default='integral',
         help='Online ID method used for adaptive locking.')
+    parser.add_argument(
+        '--eq21-input-model',
+        choices=('measured_cart', 'ideal_k'),
+        default='measured_cart',
+        help='Eq21 input model: measured_cart uses measured q(t); ideal_k assumes q(t)=K*t.')
+    parser.add_argument(
+        '--final-id-source',
+        choices=('active_id', 'zero_zeta'),
+        default='active_id',
+        help='Final ID selector. zero_zeta maps to --id-method zero-zeta-ls for conservative fixed-tau tests.')
     parser.add_argument(
         '--switch-margin',
         type=float,
@@ -1930,9 +4612,25 @@ def parse_args():
         default=0.9,
         help='Latest time to lock an adaptive estimate before fallback/abort.')
     parser.add_argument('--max-travel-mm', type=float, default=650.0)
+    parser.add_argument('--workspace-min-mm', type=float, default=0.0)
+    parser.add_argument('--workspace-max-mm', type=float, default=1150.0)
+    parser.add_argument('--workspace-margin-mm', type=float, default=5.0)
     parser.add_argument('--stream-rate-hz', type=float, default=100.0)
     parser.add_argument('--print-period', type=float, default=0.25)
     parser.add_argument('--payload-fresh-timeout', type=float, default=0.25)
+    parser.add_argument(
+        '--gantry-fresh-timeout', type=float, default=0.25,
+        help='Maximum /gantry/state receive age allowed before start and during nonzero-IC motion.')
+    parser.add_argument(
+        '--require-encoder-health',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Require fresh /payload/encoder/diagnostics with stale=0 for '
+            'nonzero-IC experiments (default: enabled). Disable only when the '
+            'payload topic intentionally comes from a non-encoder source.'
+        ),
+    )
     parser.add_argument('--cond-threshold', type=float, default=1.0e8)
     parser.add_argument('--accept-cond', type=float, default=1000.0)
     parser.add_argument('--accept-valid-count', type=int, default=1)
@@ -1950,6 +4648,10 @@ def parse_args():
         type=float,
         default=0.0,
         help='Sliding local window for integral ID. <=0 uses full-history Eq. 21 ID.')
+    parser.add_argument(
+        '--id-assume-zero-zeta',
+        action='store_true',
+        help='For integral ID, estimate omega_n assuming zeta=0 instead of fitting damping.')
     parser.add_argument('--mode-fit-window-s', type=float, default=1.00)
     parser.add_argument('--mode-fit-history-s', type=float, default=2.00)
     parser.add_argument('--mode-fit-after-s', type=float, default=0.80)
@@ -1966,6 +4668,27 @@ def parse_args():
         type=float,
         default=0.02,
         help='Reject mode-fit estimates this close to the T search bounds.')
+    parser.add_argument('--zero-zeta-window-s', type=float, default=0.0)
+    parser.add_argument('--zero-zeta-history-s', type=float, default=4.0)
+    parser.add_argument('--zero-zeta-after-s', type=float, default=0.8)
+    parser.add_argument('--zero-zeta-update-period-s', type=float, default=0.10)
+    parser.add_argument('--zero-zeta-min-samples', type=int, default=80)
+    parser.add_argument('--zero-zeta-t-min', type=float, default=0.45)
+    parser.add_argument('--zero-zeta-t-max', type=float, default=1.45)
+    parser.add_argument('--zero-zeta-grid-count', type=int, default=240)
+    parser.add_argument('--zero-zeta-min-p2p-mm', type=float, default=4.0)
+    parser.add_argument('--zero-zeta-min-amp-mm', type=float, default=1.0)
+    parser.add_argument('--zero-zeta-max-norm-rmse', type=float, default=1.5)
+    parser.add_argument(
+        '--freq-bank-update-period-s',
+        type=float,
+        default=0.10,
+        help='Minimum time between frequency-bank ID updates.')
+    parser.add_argument(
+        '--freq-bank-min-ratio',
+        type=float,
+        default=1.03,
+        help='Minimum best/second-best coherent-power ratio for frequency-bank ID.')
     parser.add_argument('--two-mode-window-s', type=float, default=1.20)
     parser.add_argument('--two-mode-history-s', type=float, default=2.00)
     parser.add_argument('--two-mode-after-s', type=float, default=0.90)
@@ -2002,7 +4725,7 @@ def parse_args():
         help='For colleague-paper-closed, choose median T from this recent pre-tau window. <=0 uses all valid estimates.')
     parser.add_argument(
         '--is2-selection-mode',
-        choices=('median', 'recent-median', 'stable-window'),
+        choices=('median', 'recent-median', 'stable-window', 'stable', 'latest'),
         default='recent-median',
         help='Estimate selector for colleague-paper-closed.')
     parser.add_argument(
@@ -2081,34 +4804,315 @@ def parse_args():
         '--robust-rope-length-m',
         type=float,
         default=1.20,
-        help='For --profile robust: nominal rope length used for model-based ZVD.')
+        help='For --profile robust/zv/nonzero-ic: nominal rope length used for model-based shaping.')
     parser.add_argument(
         '--robust-zeta',
         type=float,
         default=0.0,
-        help='For --profile robust: damping ratio used for model-based ZVD weights.')
+        help='For --profile robust/zv: damping ratio used for model-based shaper weights.')
     parser.add_argument(
         '--robust-t-scale',
         type=float,
         default=1.0,
-        help='For --profile robust: multiplier on T=pi/sqrt(g/L).')
+        help='For --profile robust/zv: multiplier on T=pi/sqrt(g/L).')
     parser.add_argument(
         '--gravity-m-s2',
         type=float,
         default=9.80665,
-        help='Gravity used by --profile robust.')
+        help='Gravity used by model-based profiles.')
+    parser.add_argument(
+        '--nonzero-ic-omega-rad-s',
+        type=float,
+        default=0.0,
+        help=(
+            'Fixed undamped natural frequency used with '
+            '--no-nonzero-ic-adaptive-frequency. <=0 uses '
+            'sqrt(gravity/robust-rope-length-m).'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-adaptive-frequency',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Fit omega and the instantaneous initial state from the latest '
+            'tau seconds of free swing (default: enabled).'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-shaper-frequency-scale',
+        type=float,
+        default=1.0,
+        help=(
+            'Experimental multiplier applied only to the nonzero-IC shaper '
+            'frequency. The fitted frequency and future-peak prediction '
+            'remain unchanged (default: 1.0).'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-finite-amplitude-correction',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'For adaptive nonzero-IC only: convert the fitted finite-amplitude '
+            'free-swing frequency to the simple-pendulum small-angle frequency '
+            'using the fitted displacement amplitude and '
+            '--robust-rope-length-m. The uncorrected fit remains in use for '
+            'state and future-peak prediction (default: disabled).'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-robust',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'Replace the two-impulse NZIC staircase with a positive-weight '
+            'specified-insensitivity schedule optimized over '
+            '--nonzero-ic-robust-band-fraction while preserving nominal '
+            'cancellation and exact travel (default: disabled).'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-robust-band-fraction',
+        type=float,
+        default=0.05,
+        help=(
+            'Fractional +/- frequency band for robust nonzero-IC schedule '
+            'optimization (default: 0.05, or +/-5%%).'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-shaper-omega-rad-s',
+        type=float,
+        default=0.0,
+        help=(
+            'Absolute experimental frequency used only by the nonzero-IC '
+            'closed-form shaper. A positive value overrides the fitted '
+            'frequency for schedule construction while adaptive state/peak '
+            'estimation remains active; 0 disables the override (default: 0).'
+        ),
+    )
+    parser.add_argument('--nonzero-ic-omega-min-rad-s', type=float, default=2.6)
+    parser.add_argument('--nonzero-ic-omega-max-rad-s', type=float, default=4.0)
+    parser.add_argument('--nonzero-ic-frequency-grid-count', type=int, default=401)
+    parser.add_argument('--nonzero-ic-min-fit-samples', type=int, default=100)
+    parser.add_argument('--nonzero-ic-min-fit-amplitude-mm', type=float, default=10.0)
+    parser.add_argument(
+        '--nonzero-ic-max-fit-nrmse',
+        type=float,
+        default=0.05,
+        help=(
+            'Maximum RMSE/fitted-amplitude accepted for adaptive free-swing '
+            'ID (default: 0.05).'
+        ),
+    )
+    parser.add_argument('--nonzero-ic-fit-update-period-s', type=float, default=0.25)
+    parser.add_argument(
+        '--controller-timed-profile',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'For adaptive nonzero-IC, atomically load the solved staircase '
+            'into the gantry controller and start it at a predicted future '
+            'positive peak (default: enabled).'
+        ),
+    )
+    parser.add_argument(
+        '--timed-profile-lead-s',
+        type=float,
+        default=0.25,
+        help='Minimum lead used when selecting the controller-owned future peak start.')
+    parser.add_argument(
+        '--timed-profile-actuation-lead-ms',
+        type=float,
+        default=0.0,
+        help=(
+            'Equivalent actuator-response delay compensation: advance every '
+            'controller-profile command edge by this many milliseconds so '
+            'the modeled physical velocity response aligns with the fitted '
+            'payload peak (default: 0). This pure-delay model does not alter '
+            'the fitted state, gains, or shaper frequency.'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-start-at-peak',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Hold zero until the fitted payload is at its positive swing peak '
+            'in the direction of travel (default: enabled).'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-peak-velocity-tolerance-mm-s',
+        type=float,
+        default=10.0,
+        help=(
+            'Maximum fitted absolute payload velocity accepted as the swing '
+            'peak (default: 10 mm/s). A tighter value may wait additional '
+            'swing cycles at a 100 Hz command rate. With the controller-timed '
+            'profile this gate applies to the predicted future-peak state; '
+            'nearest measured command/peak states are diagnostic only.'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-max-payload-queue-delay-ms',
+        type=float,
+        default=5.0,
+        help=(
+            'Maximum publisher-to-callback queue delay accepted while '
+            'arming a controller-timed nonzero-IC profile (default: 5 ms). '
+            'Delay is measured relative to the minimum observed payload '
+            'clock offset; stale queued samples are held and retried.'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-start-delay-s',
+        type=float,
+        default=None,
+        help=(
+            'Deprecated alias for --tau in --profile nonzero-ic.'
+        ),
+    )
+    parser.add_argument(
+        '--nonzero-ic-max-command-speed-mm-s',
+        type=float,
+        default=400.0,
+        help=(
+            'For --profile nonzero-ic: maximum absolute velocity allowed for '
+            'signed A0/A1 commands (default: 400 mm/s).'
+        ),
+    )
+    parser.add_argument(
+        '--initial-swing-mm',
+        type=float,
+        default=None,
+        help=(
+            'For --profile nonzero-ic: world-axis payload-minus-cart position '
+            'at MOTION_START. Omit to use /payload/pose_e_rel.'
+        ),
+    )
+    parser.add_argument(
+        '--initial-payload-velocity-mm-s',
+        type=float,
+        default=None,
+        help=(
+            'For --profile nonzero-ic: world-axis absolute payload velocity '
+            'at MOTION_START. Omit to use relative payload velocity plus cart '
+            'velocity.'
+        ),
+    )
+    parser.add_argument(
+        '--excite',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'For --profile nonzero-ic: run a closed-loop swing-up stage that '
+            'pumps the payload to --excite-target-angle-deg of axis swing '
+            'before the tau free-swing ID window (default: disabled).'
+        ),
+    )
+    parser.add_argument(
+        '--excite-only',
+        action='store_true',
+        help=(
+            'Run the bounded swing-up, return to its anchor, collect the '
+            'residual window, and exit without the nonzero-IC travel maneuver.'
+        ),
+    )
+    parser.add_argument('--excite-target-angle-deg', type=float, default=21.0)
+    parser.add_argument('--excite-angle-tolerance-deg', type=float, default=1.5)
+    parser.add_argument('--excite-angle-band-deg', type=float, default=5.0)
+    parser.add_argument(
+        '--excite-speed-mm-s',
+        type=float,
+        default=150.0,
+        help='Peak trolley speed used by the swing-up drive. Keep well under '
+             'abs(--vmax-mm-s).')
+    parser.add_argument(
+        '--excite-drive-sign',
+        type=int,
+        choices=(1, -1),
+        default=1,
+        help='Deprecated compatibility option; bounded excitation is always '
+             'in the positive axis direction.')
+    parser.add_argument('--excite-no-auto-sign', action='store_true')
+    parser.add_argument('--excite-no-auto-bias', action='store_true',
+                        help='Do not subtract the axis angle sampled at '
+                             'MOTION_START as the swing-up zero reference.')
+    parser.add_argument(
+        '--excite-travel-budget-mm', type=float, default=100.0,
+        help='Maximum positive-axis excursion from the excitation anchor.')
+    parser.add_argument('--excite-initial-excursion-mm', type=float, default=15.0)
+    parser.add_argument('--excite-excursion-step-mm', type=float, default=10.0)
+    parser.add_argument('--excite-position-kp-s', type=float, default=2.0)
+    parser.add_argument('--excite-return-speed-mm-s', type=float, default=30.0)
+    parser.add_argument('--excite-return-tolerance-mm', type=float, default=1.0)
+    parser.add_argument('--excite-slew-mm-s2', type=float, default=600.0)
+    parser.add_argument('--excite-timeout-s', type=float, default=30.0)
+    parser.add_argument('--excite-settle-cycles', type=float, default=1.0)
+    parser.add_argument('--excite-standclear-s', type=float, default=2.0)
+    parser.add_argument('--excite-abort-angle-deg', type=float, default=30.0)
+    parser.add_argument(
+        '--excite-omega-rad-s',
+        type=float,
+        default=0.0,
+        help='Pendulum frequency for the swing-up envelope estimate. '
+             '<=0 uses sqrt(gravity/--robust-rope-length-m).')
     parser.set_defaults(allow_fallback=True)
     parser.add_argument(
         '--no-fallback',
         dest='allow_fallback',
         action='store_false',
         help='Require an adaptive estimate; abort the STREAM if none is available by estimate-deadline.')
-    parser.add_argument('--residual-window', type=float, default=2.0)
+    parser.add_argument('--residual-window', type=float, default=10.0)
     parser.add_argument('--log-csv', default='')
+    parser.add_argument(
+        '--run-output-dir',
+        default='~/crane_ws/log/adaptive_runs',
+        help='Directory used for the automatically named CSV when --log-csv is omitted.')
+    parser.add_argument(
+        '--auto-plot',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Save a per-run PNG and JSON summary beside the CSV (default: enabled).')
     parser.add_argument('--no-arm', action='store_true')
     parser.add_argument('--no-auto-enable', action='store_true')
     parser.add_argument('--estimate-topic', default='/adaptive_paper_tdf/estimate')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.is2_selection_mode == 'stable':
+        args.is2_selection_mode = 'stable-window'
+    if args.nonzero_ic_start_delay_s is not None:
+        if args.tau is not None and not math.isclose(
+            args.tau,
+            args.nonzero_ic_start_delay_s,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            parser.error(
+                '--nonzero-ic-start-delay-s and --tau specify different values'
+            )
+        args.tau = args.nonzero_ic_start_delay_s
+    if args.tau is None:
+        args.tau = 5.0 if args.profile == 'nonzero-ic' else 0.75
+    if args.id_duration_s > 0.0:
+        args.tau = args.id_duration_s
+    if args.id_speed_mm_s > 0.0:
+        args.a0 = abs(args.id_speed_mm_s) / max(abs(args.vmax_mm_s), 1.0e-12)
+    if args.final_id_source == 'zero_zeta':
+        args.id_method = 'zero-zeta-ls'
+    if not args.log_csv:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        profile_tag = args.profile.replace('-', '_')
+        axis_tag = args.axis.lower()
+        target_tag = int(round(args.target_distance_mm))
+        speed_tag = int(round(abs(args.vmax_mm_s)))
+        output_dir = Path(args.run_output_dir).expanduser()
+        args.log_csv = str(
+            output_dir
+            / f'{timestamp}_{profile_tag}_{axis_tag}{target_tag}_v{speed_tag}.csv'
+        )
+    return args
 
 
 def check_args(args) -> bool:
@@ -2118,11 +5122,14 @@ def check_args(args) -> bool:
     if abs(args.vmax_mm_s) < 1.0e-9:
         print('Refusing: --vmax-mm-s must be nonzero', file=sys.stderr)
         return False
+    if not math.isfinite(args.pulse_pre_delay_s) or args.pulse_pre_delay_s < 0.0:
+        print('Refusing: --pulse-pre-delay-s must be finite and nonnegative', file=sys.stderr)
+        return False
     if not (0.0 < args.a0 < 1.0):
         print('Refusing: --a0 must be in (0, 1)', file=sys.stderr)
         return False
-    if args.tau <= 0.0:
-        print('Refusing: --tau must be positive', file=sys.stderr)
+    if not math.isfinite(args.tau) or args.tau <= 0.0:
+        print('Refusing: --tau must be finite and positive', file=sys.stderr)
         return False
     if args.id_lock_mode == 'best-cond' and args.estimate_deadline <= args.min_id_duration:
         print(
@@ -2141,6 +5148,9 @@ def check_args(args) -> bool:
         return False
     if args.payload_fresh_timeout <= 0.0:
         print('Refusing: --payload-fresh-timeout must be positive', file=sys.stderr)
+        return False
+    if not math.isfinite(args.gantry_fresh_timeout) or args.gantry_fresh_timeout <= 0.0:
+        print('Refusing: --gantry-fresh-timeout must be finite and positive', file=sys.stderr)
         return False
     if args.integral_id_window_s < 0.0:
         print('Refusing: --integral-id-window-s must be nonnegative', file=sys.stderr)
@@ -2174,6 +5184,33 @@ def check_args(args) -> bool:
         return False
     if args.mode_fit_min_samples < 4 or args.mode_fit_grid_count < 5:
         print('Refusing: mode-fit needs at least 4 samples and 5 grid points', file=sys.stderr)
+        return False
+    if args.zero_zeta_history_s <= 0.0:
+        print('Refusing: --zero-zeta-history-s must be positive', file=sys.stderr)
+        return False
+    if args.zero_zeta_window_s < 0.0:
+        print('Refusing: --zero-zeta-window-s must be nonnegative', file=sys.stderr)
+        return False
+    if args.zero_zeta_update_period_s <= 0.0:
+        print('Refusing: --zero-zeta-update-period-s must be positive', file=sys.stderr)
+        return False
+    if args.zero_zeta_t_min <= 0.0 or args.zero_zeta_t_max <= args.zero_zeta_t_min:
+        print('Refusing: zero-zeta T range must satisfy 0 < min < max', file=sys.stderr)
+        return False
+    if args.zero_zeta_min_samples < 4 or args.zero_zeta_grid_count < 5:
+        print('Refusing: zero-zeta needs at least 4 samples and 5 grid points', file=sys.stderr)
+        return False
+    if args.zero_zeta_min_p2p_mm < 0.0 or args.zero_zeta_min_amp_mm < 0.0:
+        print('Refusing: zero-zeta amplitude gates must be nonnegative', file=sys.stderr)
+        return False
+    if args.zero_zeta_max_norm_rmse <= 0.0:
+        print('Refusing: --zero-zeta-max-norm-rmse must be positive', file=sys.stderr)
+        return False
+    if args.freq_bank_update_period_s <= 0.0:
+        print('Refusing: --freq-bank-update-period-s must be positive', file=sys.stderr)
+        return False
+    if args.freq_bank_min_ratio < 1.0:
+        print('Refusing: --freq-bank-min-ratio must be at least 1.0', file=sys.stderr)
         return False
     if args.two_mode_window_s <= 0.0 or args.two_mode_history_s <= 0.0:
         print('Refusing: two-mode windows must be positive', file=sys.stderr)
@@ -2235,6 +5272,377 @@ def check_args(args) -> bool:
     if args.gravity_m_s2 <= 0.0:
         print('Refusing: --gravity-m-s2 must be positive', file=sys.stderr)
         return False
+    if not math.isfinite(args.nonzero_ic_omega_rad_s):
+        print('Refusing: --nonzero-ic-omega-rad-s must be finite', file=sys.stderr)
+        return False
+    if (
+        not math.isfinite(args.nonzero_ic_shaper_frequency_scale)
+        or args.nonzero_ic_shaper_frequency_scale < 0.8
+        or args.nonzero_ic_shaper_frequency_scale > 1.2
+    ):
+        print(
+            'Refusing: --nonzero-ic-shaper-frequency-scale must be finite '
+            'and in [0.8, 1.2]',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.profile != 'nonzero-ic'
+        and not math.isclose(
+            args.nonzero_ic_shaper_frequency_scale,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+    ):
+        print(
+            'Refusing: --nonzero-ic-shaper-frequency-scale only applies to '
+            '--profile nonzero-ic',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.nonzero_ic_finite_amplitude_correction
+        and args.profile != 'nonzero-ic'
+    ):
+        print(
+            'Refusing: --nonzero-ic-finite-amplitude-correction only applies '
+            'to --profile nonzero-ic',
+            file=sys.stderr,
+        )
+        return False
+    if args.nonzero_ic_robust and args.profile != 'nonzero-ic':
+        print(
+            'Refusing: --nonzero-ic-robust only applies to '
+            '--profile nonzero-ic',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.nonzero_ic_robust_band_fraction)
+        or args.nonzero_ic_robust_band_fraction <= 0.0
+        or args.nonzero_ic_robust_band_fraction >= 0.25
+    ):
+        print(
+            'Refusing: --nonzero-ic-robust-band-fraction must be finite '
+            'and in (0, 0.25)',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.nonzero_ic_finite_amplitude_correction
+        and not args.nonzero_ic_adaptive_frequency
+    ):
+        print(
+            'Refusing: --nonzero-ic-finite-amplitude-correction requires '
+            '--nonzero-ic-adaptive-frequency',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.nonzero_ic_shaper_omega_rad_s)
+        or args.nonzero_ic_shaper_omega_rad_s < 0.0
+    ):
+        print(
+            'Refusing: --nonzero-ic-shaper-omega-rad-s must be finite and '
+            'nonnegative',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.nonzero_ic_finite_amplitude_correction
+        and args.nonzero_ic_shaper_omega_rad_s > 0.0
+    ):
+        print(
+            'Refusing: fixed --nonzero-ic-shaper-omega-rad-s bypasses the '
+            'finite-amplitude correction; choose only one',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.nonzero_ic_omega_min_rad_s)
+        or not math.isfinite(args.nonzero_ic_omega_max_rad_s)
+        or args.nonzero_ic_omega_min_rad_s <= 0.0
+        or args.nonzero_ic_omega_max_rad_s
+        <= args.nonzero_ic_omega_min_rad_s
+    ):
+        print(
+            'Refusing: adaptive omega bounds must satisfy 0 < min < max',
+            file=sys.stderr,
+        )
+        return False
+    if args.nonzero_ic_shaper_omega_rad_s > 0.0:
+        if args.profile != 'nonzero-ic':
+            print(
+                'Refusing: --nonzero-ic-shaper-omega-rad-s only applies to '
+                '--profile nonzero-ic',
+                file=sys.stderr,
+            )
+            return False
+        if not math.isclose(
+            args.nonzero_ic_shaper_frequency_scale,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            print(
+                'Refusing: use either --nonzero-ic-shaper-omega-rad-s or '
+                '--nonzero-ic-shaper-frequency-scale, not both',
+                file=sys.stderr,
+            )
+            return False
+        if not (
+            args.nonzero_ic_omega_min_rad_s
+            <= args.nonzero_ic_shaper_omega_rad_s
+            <= args.nonzero_ic_omega_max_rad_s
+        ):
+            print(
+                'Refusing: --nonzero-ic-shaper-omega-rad-s must lie inside '
+                'the configured adaptive omega search bounds',
+                file=sys.stderr,
+            )
+            return False
+    if (
+        args.nonzero_ic_frequency_grid_count < 5
+        or args.nonzero_ic_min_fit_samples < 6
+    ):
+        print(
+            'Refusing: adaptive nonzero-IC fit needs at least 5 frequency '
+            'grid points and 6 samples',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.nonzero_ic_min_fit_amplitude_mm)
+        or args.nonzero_ic_min_fit_amplitude_mm <= 0.0
+        or not math.isfinite(args.nonzero_ic_max_fit_nrmse)
+        or args.nonzero_ic_max_fit_nrmse <= 0.0
+        or not math.isfinite(args.nonzero_ic_fit_update_period_s)
+        or args.nonzero_ic_fit_update_period_s <= 0.0
+        or not math.isfinite(
+            args.nonzero_ic_peak_velocity_tolerance_mm_s
+        )
+        or args.nonzero_ic_peak_velocity_tolerance_mm_s <= 0.0
+    ):
+        print(
+            'Refusing: adaptive nonzero-IC fit/peak gates and update period must '
+            'be finite and positive',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.profile == 'nonzero-ic'
+        and args.nonzero_ic_adaptive_frequency
+        and args.tau < 1.0
+    ):
+        print(
+            'Refusing: adaptive nonzero-IC frequency fitting needs --tau >= 1.0s',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.timed_profile_lead_s)
+        or args.timed_profile_lead_s < 0.15
+        or args.timed_profile_lead_s > 2.0
+    ):
+        print(
+            'Refusing: --timed-profile-lead-s must be finite and in [0.15, 2.0]s',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.profile == 'nonzero-ic'
+        and args.nonzero_ic_robust
+        and args.controller_timed_profile
+        and args.timed_profile_lead_s < 0.75
+    ):
+        print(
+            'Refusing: robust nonzero-IC optimization with a controller-timed '
+            'profile needs --timed-profile-lead-s >= 0.75s',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.timed_profile_actuation_lead_ms)
+        or args.timed_profile_actuation_lead_ms < 0.0
+        or args.timed_profile_actuation_lead_ms > 100.0
+    ):
+        print(
+            'Refusing: --timed-profile-actuation-lead-ms must be finite and '
+            'in [0, 100]ms',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.nonzero_ic_max_payload_queue_delay_ms)
+        or args.nonzero_ic_max_payload_queue_delay_ms < 0.0
+        or args.nonzero_ic_max_payload_queue_delay_ms > 100.0
+    ):
+        print(
+            'Refusing: --nonzero-ic-max-payload-queue-delay-ms must be '
+            'finite and in [0, 100]ms',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.timed_profile_actuation_lead_ms > 0.0
+        and (
+            args.profile != 'nonzero-ic'
+            or not args.controller_timed_profile
+        )
+    ):
+        print(
+            'Refusing: --timed-profile-actuation-lead-ms requires '
+            '--profile nonzero-ic with --controller-timed-profile',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.profile == 'nonzero-ic'
+        and args.controller_timed_profile
+        and not args.nonzero_ic_adaptive_frequency
+    ):
+        print(
+            'Refusing: --controller-timed-profile requires adaptive frequency/state fitting',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        not math.isfinite(args.nonzero_ic_max_command_speed_mm_s)
+        or args.nonzero_ic_max_command_speed_mm_s <= 0.0
+    ):
+        print(
+            'Refusing: --nonzero-ic-max-command-speed-mm-s must be finite and positive',
+            file=sys.stderr,
+        )
+        return False
+    if (
+        args.profile == 'nonzero-ic'
+        and args.nonzero_ic_max_command_speed_mm_s < abs(args.vmax_mm_s)
+    ):
+        print(
+            'Refusing: --nonzero-ic-max-command-speed-mm-s must be at least '
+            'abs(--vmax-mm-s)',
+            file=sys.stderr,
+        )
+        return False
+    if args.excite_only and not args.excite:
+        print('Refusing: --excite-only requires --excite', file=sys.stderr)
+        return False
+    if args.excite:
+        if args.profile != 'nonzero-ic':
+            print(
+                'Refusing: --excite is only supported with --profile nonzero-ic',
+                file=sys.stderr,
+            )
+            return False
+        excite_finite = (
+            args.excite_target_angle_deg,
+            args.excite_angle_tolerance_deg,
+            args.excite_angle_band_deg,
+            args.excite_speed_mm_s,
+            args.excite_travel_budget_mm,
+            args.excite_initial_excursion_mm,
+            args.excite_excursion_step_mm,
+            args.excite_position_kp_s,
+            args.excite_return_speed_mm_s,
+            args.excite_return_tolerance_mm,
+            args.excite_slew_mm_s2,
+            args.excite_timeout_s,
+            args.excite_settle_cycles,
+            args.excite_standclear_s,
+            args.excite_abort_angle_deg,
+            args.excite_omega_rad_s,
+        )
+        if any(not math.isfinite(value) for value in excite_finite):
+            print('Refusing: --excite-* values must be finite', file=sys.stderr)
+            return False
+        if not (0.0 < args.excite_target_angle_deg < args.excite_abort_angle_deg):
+            print(
+                'Refusing: need 0 < --excite-target-angle-deg < '
+                '--excite-abort-angle-deg',
+                file=sys.stderr,
+            )
+            return False
+        if args.excite_angle_tolerance_deg <= 0.0:
+            print('Refusing: --excite-angle-tolerance-deg must be positive', file=sys.stderr)
+            return False
+        if args.excite_angle_band_deg < args.excite_angle_tolerance_deg:
+            print(
+                'Refusing: --excite-angle-band-deg must be >= '
+                '--excite-angle-tolerance-deg',
+                file=sys.stderr,
+            )
+            return False
+        if not (0.0 < args.excite_speed_mm_s <= abs(args.vmax_mm_s)):
+            print(
+                'Refusing: --excite-speed-mm-s must be in (0, abs(--vmax-mm-s)]',
+                file=sys.stderr,
+            )
+            return False
+        if args.excite_travel_budget_mm <= 0.0 or args.excite_timeout_s <= 0.0:
+            print(
+                'Refusing: --excite-travel-budget-mm and --excite-timeout-s must '
+                'be positive',
+                file=sys.stderr,
+            )
+            return False
+        if not (
+            0.0 < args.excite_initial_excursion_mm
+            <= args.excite_travel_budget_mm
+            and args.excite_excursion_step_mm > 0.0
+        ):
+            print(
+                'Refusing: need 0 < --excite-initial-excursion-mm <= '
+                '--excite-travel-budget-mm and a positive excursion step',
+                file=sys.stderr,
+            )
+            return False
+        if not (
+            args.excite_position_kp_s > 0.0
+            and args.excite_return_speed_mm_s > 0.0
+            and args.excite_return_tolerance_mm > 0.0
+            and args.excite_slew_mm_s2 > 0.0
+        ):
+            print(
+                'Refusing: bounded excitation feedback, return, tolerance, and '
+                'slew parameters must be positive',
+                file=sys.stderr,
+            )
+            return False
+        if args.excite_settle_cycles <= 0.0 or args.excite_standclear_s < 0.0:
+            print(
+                'Refusing: --excite-settle-cycles must be positive and '
+                '--excite-standclear-s non-negative',
+                file=sys.stderr,
+            )
+            return False
+        if args.excite_omega_rad_s < 0.0:
+            print('Refusing: --excite-omega-rad-s must be >= 0', file=sys.stderr)
+            return False
+
+    workspace_values = (
+        args.workspace_min_mm,
+        args.workspace_max_mm,
+        args.workspace_margin_mm,
+    )
+    if any(not math.isfinite(value) for value in workspace_values):
+        print('Refusing: workspace limits must be finite', file=sys.stderr)
+        return False
+    if (
+        args.workspace_margin_mm < 0.0
+        or args.workspace_max_mm
+        <= args.workspace_min_mm + 2.0 * args.workspace_margin_mm
+    ):
+        print('Refusing: invalid workspace bounds or margin', file=sys.stderr)
+        return False
+    for option_name, value in (
+        ('--initial-swing-mm', args.initial_swing_mm),
+        ('--initial-payload-velocity-mm-s', args.initial_payload_velocity_mm_s),
+    ):
+        if value is not None and not math.isfinite(value):
+            print(f'Refusing: {option_name} must be finite', file=sys.stderr)
+            return False
     if args.residual_window <= 0.0:
         print('Refusing: --residual-window must be positive', file=sys.stderr)
         return False
@@ -2247,7 +5655,14 @@ def check_args(args) -> bool:
         return False
 
     tf = args.target_distance_mm / abs(args.vmax_mm_s)
-    if args.profile == 'robust':
+    # A pulse baseline is a single constant-velocity interval followed by
+    # zero.  It has no delayed shaper switches, so the T/2T feasibility guards
+    # below do not apply; only the general speed, travel, and workspace checks
+    # above are required.
+    if args.profile == 'pulse':
+        return True
+
+    if args.profile in ('robust', 'zv'):
         omega_n = math.sqrt(args.gravity_m_s2 / args.robust_rope_length_m)
         T_guard = args.robust_t_scale * math.pi / omega_n
     else:
@@ -2264,6 +5679,44 @@ def check_args(args) -> bool:
                 f'Refusing: {args.profile} needs tf > tau + 2*Tmax. '
                 f'Here tf={tf:.3f}s and tau+2*Tmax={args.tau + 2.0 * args.zv_t_max:.3f}s. '
                 'Use lower --vmax-mm-s, smaller --tau/--zv-t-max, or larger distance.',
+                file=sys.stderr,
+            )
+            return False
+    elif args.profile == 'nonzero-ic':
+        if (
+            not args.nonzero_ic_adaptive_frequency
+            and args.initial_swing_mm is not None
+            and args.initial_payload_velocity_mm_s is not None
+        ):
+            omega_n = (
+                args.nonzero_ic_omega_rad_s
+                if args.nonzero_ic_omega_rad_s > 0.0
+                else math.sqrt(args.gravity_m_s2 / args.robust_rope_length_m)
+            )
+            direction = 1.0 if args.vmax_mm_s >= 0.0 else -1.0
+            try:
+                solve_nonzero_ic_shaper(
+                    initial_swing_mm=direction * args.initial_swing_mm,
+                    initial_payload_velocity_mm_s=(
+                        direction * args.initial_payload_velocity_mm_s
+                    ),
+                    maximum_speed_mm_s=abs(args.vmax_mm_s),
+                    omega_n_rad_s=omega_n,
+                    move_duration_s=tf,
+                    maximum_absolute_gain=(
+                        args.nonzero_ic_max_command_speed_mm_s
+                        / abs(args.vmax_mm_s)
+                    ),
+                )
+            except ValueError as exc:
+                print(f'Refusing: invalid nonzero-IC profile: {exc}', file=sys.stderr)
+                return False
+    elif args.profile == 'zv':
+        if tf <= T_guard:
+            print(
+                f'Refusing: ZV shaper needs tf=distance/vmax > T. '
+                f'Here tf={tf:.3f}s and guard T={T_guard:.3f}s. '
+                'Use lower --vmax-mm-s or larger --target-distance-mm.',
                 file=sys.stderr,
             )
             return False

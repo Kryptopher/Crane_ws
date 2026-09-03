@@ -2,6 +2,9 @@
 
 gantry_controller:
   ros__parameters:
+    # SC4-HUB serial network rate. Teknic SC-HUB docs list 115200 and 230400.
+    teknic_baud_rate: 230400
+
     # Homing: sensor_inputs = read SC4 0A/1B, seek back then left (no ClearView homing save)
     # teknic_homing = Motion.Homing.Initiate (requires ClearView HOME_TO_SWITCH setup)
     homing_mode: sensor_inputs
@@ -23,6 +26,17 @@ gantry_controller:
     home_left_input_active_high: true
     homing_input_debounce_ticks: 3
 
+    # Secondary software-monitored E-stop on SC4 node 1 input A. The switch is
+    # normally closed: raw=1 released, raw=0 pressed/broken wire. This invokes
+    # an abrupt NodeStop on both motors and latches until physical release plus
+    # an explicit /gantry/clear_estop. Use the SC4 Global Stop / external safety
+    # circuit as the primary safety path; this 100 Hz software path is backup.
+    hardware_estop_enable: true
+    hardware_estop_node: 1
+    hardware_estop_input: a
+    hardware_estop_active_high: false
+    hardware_estop_debounce_ticks: 1
+
     # Cart pose in gantry frame (origin at last successful homing)
     publish_odom: true
     publish_odom_tf: true
@@ -30,7 +44,7 @@ gantry_controller:
     odom_child_frame_id: gantry_cart
 
     # Gantry Cartesian workspace (motor encoders → cart_x, cart_y)
-    workspace_limit_m: 1.00
+    workspace_limit_m: 1.15
     workspace_limit_enable: true
 
     # Payload vision limits disabled until crane-frame pose is available
@@ -40,14 +54,23 @@ gantry_controller:
     # TRAJ: real-time STREAM commands on /traj_cmd (research nodes)
     traj_realtime_enable: true
     traj_stream_timeout_s: 0.5
+    # For staircase/research profiles, avoid re-sending identical motor velocity
+    # commands every 10 ms. Commands still refresh at the keepalive interval.
+    traj_write_on_change_only: false
+    traj_write_keepalive_s: 0.10
+    traj_write_deadband_mm_s: 0.5
 
     # Joystick → cart velocity (lab frame: bottom-left origin, +X right, +Y up)
     joy_axis_sign_x: -1.0
     joy_axis_sign_y: 1.0
 
     # /gantry/state bootstrap rate; follows /stack/pose_sync_hz when adaptive
-    stack_pose_publish_hz: 50.0
-    stack_pose_sync_adaptive: true
+    stack_pose_publish_hz: 100.0
+    stack_pose_sync_adaptive: false
+    # measured = Teknic VelMeasured; position = filtered d(cart position)/dt.
+    cart_velocity_source: measured
+    motor_velocity_read_every_n: 2
+    position_velocity_alpha: 0.25
 
     # Dashboard go-to / MoveTo position moves (Teknic VelLimit from cart speed)
     mission_move_vel_ms: 0.10

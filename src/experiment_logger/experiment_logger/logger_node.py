@@ -55,7 +55,10 @@ class LoggerNode(Node):
 
         self.declare_parameter('output_dir', os.path.expanduser('~/payload_logs'))
         self.declare_parameter('flush_every', 50)
-        self.declare_parameter('warmup_sec', 1.0)
+        # Long enough for DDS discovery of every stream: the header is written
+        # once, so a stream that is still undiscovered at this point is missing
+        # from the CSV for the whole run.
+        self.declare_parameter('warmup_sec', 2.5)
         self.declare_parameter('stale_timeout_sec', 2.0)
         self.declare_parameter('rate_window_sec', 2.0)
         self.declare_parameter('min_log_hz', 1.0)
@@ -231,7 +234,7 @@ class LoggerNode(Node):
         if self._wait_motion and not self._motion_started:
             return
         now = time.monotonic()
-        self._last_imu = list(msg.data[:9])
+        self._last_imu = list(msg.data[:10])
         self._last_imu_rx = now
         self._imu_times.append(now)
         self._maybe_start_logging()
@@ -425,6 +428,7 @@ class LoggerNode(Node):
             header.extend([
                 'imu1_gx_dps', 'imu1_gy_dps', 'imu1_gz_dps',
                 'imu2_gx_dps', 'imu2_gy_dps', 'imu2_gz_dps',
+                'packet_age_ms', 'packet_seen',
             ])
         self._writer.writerow(header)
         self._logging_ready = True
@@ -442,6 +446,20 @@ class LoggerNode(Node):
             streams.append('encoder relative (/payload/pose_e_rel)')
         if self._log_imu:
             streams.append('IMU (/payload/imu_raw)')
+
+        missing = [
+            name for name, active in (
+                ('vision (/payload/state)', self._log_pose),
+                ('encoder (/payload/pose_e)', self._log_pose_e),
+                ('encoder relative (/payload/pose_e_rel)', self._log_pose_e_rel),
+                ('IMU (/payload/imu_raw)', self._log_imu),
+            ) if not active
+        ]
+        if missing:
+            self.get_logger().warn(
+                f'Not logging (no data during warmup): {", ".join(missing)} — '
+                'these columns are absent for the whole run. Raise warmup_sec '
+                'and restart if that is not intended.')
 
         if self._synced_stream_mode:
             hz = self._matched_log_hz(now)
@@ -564,10 +582,14 @@ class LoggerNode(Node):
             if include_imu and self._last_imu is not None:
                 imu = self._last_imu
                 # imu_raw layout: [t, arduino_ms, imu1_g(xyz)_dps,
-                # imu2_g(xyz)_dps, packet_age_ms, packet_seen].
+                # imu2_g(xyz)_dps, packet_age_ms, packet_seen]. packet_* are
+                # logged too: without them a stalled radio link is
+                # indistinguishable from a genuinely quiet payload.
                 row.extend([f'{imu[i]:.6f}' for i in range(2, 8)])
+                row.extend([f'{imu[i]:.6f}' if i < len(imu) else ''
+                            for i in (8, 9)])
             else:
-                row.extend([''] * 6)
+                row.extend([''] * 8)
 
         self._writer.writerow(row)
         self._rows += 1

@@ -22,6 +22,7 @@ constexpr double GantryController::JOG_SPEEDS[];
 GantryController::GantryController(const rclcpp::NodeOptions & options)
 : Node("gantry_controller", options),
   sys_mgr_(nullptr), port_(nullptr), node_a_(nullptr), node_b_(nullptr),
+  teknic_baud_rate_(230400),
   
   current_mode_(Mode::IDLE),
   hardware_initialized_(false), motors_enabled_(false),
@@ -37,31 +38,51 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
   home_back_input_active_high_(false), home_left_input_active_high_(true),
   homing_input_debounce_ticks_(5),
   homing_left_debounce_count_(0), homing_back_debounce_count_(0),
+  hardware_estop_enable_(true), hardware_estop_node_(1),
+  hardware_estop_input_b_(false), hardware_estop_active_high_(false),
+  hardware_estop_debounce_ticks_(1), hardware_estop_debounce_count_(0),
+  hardware_estop_input_active_(false),
   publish_odom_(true), publish_odom_tf_(true),
   odom_frame_id_("gantry"), odom_child_frame_id_("gantry_cart"),
   estop_active_(false), move_in_progress_(false),
   motor_a_pos_rad_(0), motor_a_vel_rads_(0),
   motor_b_pos_rad_(0), motor_b_vel_rads_(0),
   cart_x_m_(0), cart_y_m_(0), cart_vx_ms_(0), cart_vy_ms_(0),
+  cart_vx_measured_ms_(0), cart_vy_measured_ms_(0),
+  cart_vx_from_position_ms_(0), cart_vy_from_position_ms_(0),
+  last_cart_x_for_velocity_m_(0), last_cart_y_for_velocity_m_(0),
+  position_velocity_alpha_(0.25), position_velocity_initialized_(false),
+  cart_velocity_source_("measured"),
+  motor_velocity_read_every_n_(2), motor_velocity_read_counter_(0),
   home_offset_a_(0), home_offset_b_(0),
   homing_cart_bias_x_(0), homing_cart_bias_y_(0),
   jog_vx_(0), jog_vy_(0), jog_speed_preset_(0),
   joy_enable_held_(false),
-  zv_state_(ZvState::IDLE), zv_T_(1.0), zv_A_(0.300),
+  zv_state_(ZvState::IDLE), zv_T_(1.0), zv_zeta_(0.0),
   zv_dir_x_(0), zv_dir_y_(0), zv_button_held_(false),
   mission_target_x_(0), mission_target_y_(0),
   mission_move_vel_ms_(0.10), mission_move_accel_ms2_(0.20),
   traj_index_(0), traj_profile_loaded_(false),
   traj_running_(false), traj_abort_(false),
   traj_realtime_enable_(true), traj_realtime_active_(false),
+  timed_profile_armed_(false), precise_profile_timing_(false),
+  timed_profile_start_ros_s_(0.0),
   stream_vx_mm_s_(0.0), stream_vy_mm_s_(0.0),
   traj_stream_timeout_s_(0.5),
+  traj_write_on_change_only_(false), traj_write_keepalive_s_(0.10),
+  traj_write_deadband_mm_s_(0.5),
+  last_sent_traj_vx_ms_(0.0), last_sent_traj_vy_ms_(0.0),
+  last_sent_traj_velocity_valid_(false),
   workspace_limit_m_(1.0), workspace_limit_enable_(true),
   workspace_limit_tripped_(false),
   payload_position_limit_m_(1.0), payload_limit_tripped_(false),
   payload_limit_monitor_enable_(false),
-  last_read_ms_(0), last_write_ms_(0), error_count_(0),
-  stack_pose_publish_hz_(50.0), stack_pose_sync_adaptive_(true),
+  last_read_ms_(0), last_write_ms_(0),
+  last_pos_a_read_ms_(0), last_pos_b_read_ms_(0),
+  last_vel_a_read_ms_(0), last_vel_b_read_ms_(0),
+  last_read_math_ms_(0),
+  error_count_(0),
+  stack_pose_publish_hz_(100.0), stack_pose_sync_adaptive_(false),
   measured_state_rate_hz_(0.0)
 {
   RCLCPP_INFO(get_logger(), "═══════════════════════════════════════════");
@@ -75,6 +96,12 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
   odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/gantry/odom", 10);
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   traj_cmd_pub_ = create_publisher<gantry_control::msg::TrajCmd>("/traj_cmd", 10);
+  read_timing_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+    "/gantry/read_timing", 10);
+  traj_latency_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+    "/gantry/traj_latency", 10);
+  home_sensors_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+    "/gantry/home_sensors", 10);
 
   // ── Subscribers ──
   joy_sub_ = create_subscription<sensor_msgs::msg::Joy>(
@@ -108,6 +135,29 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
     "/gantry/disable",
     std::bind(&GantryController::disable_callback, this, _1, _2));
 
+  force_home_srv_ = create_service<std_srvs::srv::Trigger>(
+    "/gantry/force_home",
+    std::bind(&GantryController::force_home_callback, this, _1, _2));
+
+  execute_timed_profile_srv_ =
+    create_service<gantry_control::srv::ExecuteTimedProfile>(
+    "/gantry/execute_timed_profile",
+    std::bind(
+      &GantryController::execute_timed_profile_callback, this, _1, _2));
+
+  // ── Hardware connection parameters ──
+  // Must be declared before init_hardware(), because the SC4-HUB baud rate is
+  // selected while opening the Teknic port.
+  declare_parameter("teknic_baud_rate", 230400);
+  teknic_baud_rate_ = static_cast<int>(get_parameter("teknic_baud_rate").as_int());
+  if (teknic_baud_rate_ != MN_BAUD_12X && teknic_baud_rate_ != MN_BAUD_24X) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Unsupported SC4-HUB baud rate %d; using 115200. Supported test values: 115200, 230400.",
+      teknic_baud_rate_);
+    teknic_baud_rate_ = MN_BAUD_12X;
+  }
+
   // ── Initialize hardware ──
   if (!init_hardware()) {
     RCLCPP_FATAL(get_logger(), "Hardware initialization failed!");
@@ -115,11 +165,14 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
   }
 
   // ── Parameters ──
+  // zv_T: shaper impulse spacing (s), i.e. pi / omega_d. Can be pushed live by
+  // an adaptive sway-frequency identification node (see scripts/adaptive_id_player.py).
+  // zv_zeta: payload damping ratio used to compute the robust ZVD amplitudes.
   declare_parameter("zv_T", 1.0);
-  declare_parameter("zv_A", 0.300);
+  declare_parameter("zv_zeta", 0.0);
   zv_T_ = get_parameter("zv_T").as_double();
-  zv_A_ = get_parameter("zv_A").as_double();
-  RCLCPP_INFO(get_logger(), "ZV params: T=%.3fs A=%.0fmm/s", zv_T_, zv_A_*1000);
+  zv_zeta_ = get_parameter("zv_zeta").as_double();
+  RCLCPP_INFO(get_logger(), "ZVD shaper params: T=%.3fs zeta=%.3f", zv_T_, zv_zeta_);
 
   declare_parameter("workspace_limit_m", 1.0);
   declare_parameter("workspace_limit_enable", true);
@@ -133,10 +186,21 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
 
   declare_parameter("traj_realtime_enable", true);
   declare_parameter("traj_stream_timeout_s", 0.5);
+  declare_parameter("traj_write_on_change_only", false);
+  declare_parameter("traj_write_keepalive_s", 0.10);
+  declare_parameter("traj_write_deadband_mm_s", 0.5);
   traj_realtime_enable_ = get_parameter("traj_realtime_enable").as_bool();
   traj_stream_timeout_s_ = get_parameter("traj_stream_timeout_s").as_double();
+  traj_write_on_change_only_ = get_parameter("traj_write_on_change_only").as_bool();
+  traj_write_keepalive_s_ = std::max(0.0, get_parameter("traj_write_keepalive_s").as_double());
+  traj_write_deadband_mm_s_ = std::max(0.0, get_parameter("traj_write_deadband_mm_s").as_double());
   RCLCPP_INFO(get_logger(), "TRAJ realtime STREAM: %s",
               traj_realtime_enable_ ? "enabled" : "disabled (buffered only)");
+  RCLCPP_INFO(
+    get_logger(),
+    "TRAJ motor writes: %s; keepalive=%.3fs deadband=%.2fmm/s",
+    traj_write_on_change_only_ ? "on command change + keepalive" : "every control loop",
+    traj_write_keepalive_s_, traj_write_deadband_mm_s_);
 
   declare_parameter("homing_mode", "sensor_inputs");
   declare_parameter("auto_home_before_run", true);
@@ -152,6 +216,11 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
   declare_parameter("home_back_input_active_high", false);
   declare_parameter("home_left_input_active_high", true);
   declare_parameter("homing_input_debounce_ticks", 5);
+  declare_parameter("hardware_estop_enable", true);
+  declare_parameter("hardware_estop_node", 1);
+  declare_parameter("hardware_estop_input", "a");
+  declare_parameter("hardware_estop_active_high", false);
+  declare_parameter("hardware_estop_debounce_ticks", 1);
 
   const std::string homing_mode_str = get_parameter("homing_mode").as_string();
   homing_mode_ = (homing_mode_str == "teknic_homing")
@@ -176,18 +245,39 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
   home_left_input_active_high_ = get_parameter("home_left_input_active_high").as_bool();
   homing_input_debounce_ticks_ =
     std::max(1, static_cast<int>(get_parameter("homing_input_debounce_ticks").as_int()));
+  hardware_estop_enable_ = get_parameter("hardware_estop_enable").as_bool();
+  hardware_estop_node_ =
+    static_cast<size_t>(get_parameter("hardware_estop_node").as_int());
+  {
+    const std::string in = get_parameter("hardware_estop_input").as_string();
+    hardware_estop_input_b_ = (in == "b" || in == "B");
+  }
+  hardware_estop_active_high_ = get_parameter("hardware_estop_active_high").as_bool();
+  hardware_estop_debounce_ticks_ = std::max(
+    1, static_cast<int>(get_parameter("hardware_estop_debounce_ticks").as_int()));
 
   RCLCPP_INFO(get_logger(),
               "Homing mode=%s auto_before_run=%s timeout=%.0fs "
-              "seek from mission_move_vel_ms (legacy vx/vy params ignored) "
+              "seek speed from mission_move_vel_ms, seek dir X=%s Y=%s "
+              "(sign of homing_seek_vx_ms/homing_seek_vy_ms) "
               "left=node%zu in%c back=node%zu in%c back_at=%s left_at=%s",
               homing_mode_ == HomingMode::SensorInputs ? "sensor_inputs" : "teknic_homing",
               auto_home_before_run_ ? "yes" : "no",
               homing_timeout_s_,
+              homing_seek_vx_ms_ >= 0.0 ? "+X" : "-X",
+              homing_seek_vy_ms_ >= 0.0 ? "+Y" : "-Y",
               home_left_node_, home_left_input_b_ ? 'B' : 'A',
               home_back_node_, home_back_input_b_ ? 'B' : 'A',
               home_back_input_active_high_ ? "high" : "low",
               home_left_input_active_high_ ? "high" : "low");
+  RCLCPP_INFO(
+    get_logger(),
+    "Hardware E-stop backup=%s node%zu in%c active-%s debounce=%d tick(s); "
+    "physical release + explicit clear required",
+    hardware_estop_enable_ ? "enabled" : "disabled",
+    hardware_estop_node_, hardware_estop_input_b_ ? 'B' : 'A',
+    hardware_estop_active_high_ ? "high" : "low",
+    hardware_estop_debounce_ticks_);
 
   declare_parameter("payload_position_limit_mm", 1000.0);
   declare_parameter("payload_limit_monitor_enable", false);
@@ -205,6 +295,25 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(get_logger(),
               "MISSION move limits: vel=%.3f m/s accel=%.3f m/s²",
               mission_move_vel_ms_, mission_move_accel_ms2_);
+  // Accept runtime updates so each experiment run can command its own speed.
+  // Unknown parameter names fall through untouched (successful=true).
+  param_cb_handle_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & params) {
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      for (const auto & p : params) {
+        if (p.get_name() == "mission_move_vel_ms") {
+          mission_move_vel_ms_ = std::clamp(p.as_double(), 0.01, MAX_VEL_MS);
+          RCLCPP_INFO(get_logger(), "mission_move_vel_ms → %.3f m/s",
+                      mission_move_vel_ms_);
+        } else if (p.get_name() == "mission_move_accel_ms2") {
+          mission_move_accel_ms2_ = std::clamp(p.as_double(), 0.05, 2.0);
+          RCLCPP_INFO(get_logger(), "mission_move_accel_ms2 → %.3f m/s²",
+                      mission_move_accel_ms2_);
+        }
+      }
+      return result;
+    });
   if (payload_limit_monitor_enable_) {
     payload_pose_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
       "/payload/pose", rclcpp::SensorDataQoS(),
@@ -235,16 +344,40 @@ GantryController::GantryController(const rclcpp::NodeOptions & options)
               "Joystick signs: stick→(+X right, +Y up) = (%.0f, %.0f) × raw axes",
               joy_axis_sign_x_, joy_axis_sign_y_);
 
-  declare_parameter("stack_pose_publish_hz", 50.0);
-  declare_parameter("stack_pose_sync_adaptive", true);
+  declare_parameter("stack_pose_publish_hz", 100.0);
+  declare_parameter("stack_pose_sync_adaptive", false);
   stack_pose_publish_hz_ = get_parameter("stack_pose_publish_hz").as_double();
   stack_pose_publish_hz_ = std::clamp(stack_pose_publish_hz_, 5.0, 200.0);
   stack_pose_sync_adaptive_ = get_parameter("stack_pose_sync_adaptive").as_bool();
   last_state_publish_time_ = std::chrono::steady_clock::now();
 
+  declare_parameter("cart_velocity_source", "measured");
+  declare_parameter("motor_velocity_read_every_n", 2);
+  declare_parameter("position_velocity_alpha", 0.25);
+  cart_velocity_source_ = get_parameter("cart_velocity_source").as_string();
+  if (cart_velocity_source_ != "measured" && cart_velocity_source_ != "position") {
+    RCLCPP_WARN(
+      get_logger(),
+      "Unknown cart_velocity_source '%s'; using measured. Valid values: measured, position.",
+      cart_velocity_source_.c_str());
+    cart_velocity_source_ = "measured";
+  }
+  motor_velocity_read_every_n_ = std::max(
+    1, static_cast<int>(get_parameter("motor_velocity_read_every_n").as_int()));
+  position_velocity_alpha_ = std::clamp(
+    get_parameter("position_velocity_alpha").as_double(), 0.0, 1.0);
+  RCLCPP_INFO(
+    get_logger(),
+    "Cart velocity source: %s; Teknic VelMeasured read every %d control loop(s); "
+    "position velocity alpha=%.2f",
+    cart_velocity_source_.c_str(), motor_velocity_read_every_n_, position_velocity_alpha_);
+
   // ── Timers ──
   // 100 Hz control loop (jog, homing, mission)
   control_timer_ = create_wall_timer(10ms, std::bind(&GantryController::control_loop, this));
+  // 10 Hz home-sensor diagnostics for wiring/polarity verification
+  home_sensors_timer_ = create_wall_timer(
+    100ms, std::bind(&GantryController::publish_home_sensors, this));
   if (stack_pose_sync_adaptive_) {
     pose_sync_hz_sub_ = create_subscription<std_msgs::msg::Float64>(
       "/stack/pose_sync_hz", rclcpp::QoS(1).reliable(),
@@ -314,6 +447,10 @@ void GantryController::shutdown_for_exit()
 void GantryController::control_loop()
 {
   if (!hardware_initialized_) return;
+  // Check the physical E-stop before encoder reads, workspace checks, or any
+  // operating-mode command. An active-low/open circuit immediately issues
+  // NodeStop to both axes and latches estop_active_.
+  monitor_hardware_estop();
   auto t0 = std::chrono::steady_clock::now();
   // ── Read motor encoders first (PosnMeasured) for state + TRAJ PLAYBACK log ──
   read_encoders();
@@ -386,6 +523,72 @@ void GantryController::publish_state()
   state_msg.loop_rate_hz = measured_state_rate_hz_;
   state_pub_->publish(state_msg);
 
+  auto timing_msg = std_msgs::msg::Float64MultiArray();
+  timing_msg.layout.dim.resize(1);
+  timing_msg.layout.dim[0].label =
+    "total_read_ms,pos_a_read_ms,pos_b_read_ms,vel_a_read_ms,vel_b_read_ms,"
+    "read_math_ms,write_ms,state_publish_hz,error_count";
+  timing_msg.layout.dim[0].size = 9;
+  timing_msg.layout.dim[0].stride = 9;
+  timing_msg.data = {
+    last_read_ms_,
+    last_pos_a_read_ms_,
+    last_pos_b_read_ms_,
+    last_vel_a_read_ms_,
+    last_vel_b_read_ms_,
+    last_read_math_ms_,
+    last_write_ms_,
+    measured_state_rate_hz_,
+    static_cast<double>(error_count_),
+  };
+  read_timing_pub_->publish(timing_msg);
+
+  // One synchronized diagnostic record for command transport, controller
+  // application, motor-write completion, and encoder feedback.  ROS time is
+  // used for cross-node timestamps; the controller's 100 Hz loop determines
+  // the physical-response resolution.
+  auto latency_msg = std_msgs::msg::Float64MultiArray();
+  latency_msg.layout.dim.resize(1);
+  latency_msg.layout.dim[0].label =
+    "state_stamp_s,encoder_read_stamp_s,stream_seq_rx,stream_seq_applied,"
+    "source_stamp_s,controller_rx_stamp_s,apply_begin_stamp_s,apply_done_stamp_s,"
+    "received_vx_mm_s,received_vy_mm_s,applied_vx_mm_s,applied_vy_mm_s,"
+    "cart_x_mm,cart_y_mm,selected_vx_mm_s,selected_vy_mm_s,"
+    "motor_vx_mm_s,motor_vy_mm_s,position_vx_mm_s,position_vy_mm_s,"
+    "motor_a_position_rad,motor_b_position_rad,motor_a_velocity_rad_s,"
+    "motor_b_velocity_rad_s,read_time_ms,write_time_ms";
+  latency_msg.layout.dim[0].size = 26;
+  latency_msg.layout.dim[0].stride = 26;
+  latency_msg.data = {
+    rclcpp::Time(state_msg.header.stamp).seconds(),
+    encoder_read_stamp_s_,
+    static_cast<double>(traj_stream_seq_),
+    static_cast<double>(traj_applied_seq_),
+    traj_source_stamp_s_,
+    traj_rx_stamp_s_,
+    traj_apply_begin_stamp_s_,
+    traj_apply_done_stamp_s_,
+    traj_received_vx_mm_s_,
+    traj_received_vy_mm_s_,
+    traj_applied_vx_mm_s_,
+    traj_applied_vy_mm_s_,
+    1000.0 * cart_x_m_,
+    1000.0 * cart_y_m_,
+    1000.0 * cart_vx_ms_,
+    1000.0 * cart_vy_ms_,
+    1000.0 * cart_vx_measured_ms_,
+    1000.0 * cart_vy_measured_ms_,
+    1000.0 * cart_vx_from_position_ms_,
+    1000.0 * cart_vy_from_position_ms_,
+    motor_a_pos_rad_,
+    motor_b_pos_rad_,
+    motor_a_vel_rads_,
+    motor_b_vel_rads_,
+    last_read_ms_,
+    last_write_ms_,
+  };
+  traj_latency_pub_->publish(latency_msg);
+
   // ── Joint states (for visualization / compatibility) ──
   auto js_msg = sensor_msgs::msg::JointState();
   js_msg.header.stamp = now();
@@ -424,6 +627,47 @@ void GantryController::publish_state_if_due()
     return;
   }
   publish_state();
+}
+
+void GantryController::publish_home_sensors()
+{
+  if (!hardware_initialized_ || !node_a_ || !node_b_) {
+    return;
+  }
+  // Published at 10 Hz in every mode (including during a homing seek) so the
+  // raw home inputs can be watched live while diagnosing a failed approach.
+
+  bool n0a, n0b, n1a, n1b;
+  try {
+    n0a = read_hub_input_raw(0, false);
+    n0b = read_hub_input_raw(0, true);
+    n1a = read_hub_input_raw(1, false);
+    n1b = read_hub_input_raw(1, true);
+  } catch (...) {
+    return;
+  }
+
+  auto msg = std_msgs::msg::Float64MultiArray();
+  msg.layout.dim.resize(1);
+  msg.layout.dim[0].label =
+    "node0_InA,node0_InB,node1_InA,node1_InB,"
+    "back_active,left_active,"
+    "back_node,back_input_b,back_active_high,"
+    "left_node,left_input_b,left_active_high";
+  msg.layout.dim[0].size = 12;
+  msg.layout.dim[0].stride = 12;
+  msg.data = {
+    n0a ? 1.0 : 0.0, n0b ? 1.0 : 0.0, n1a ? 1.0 : 0.0, n1b ? 1.0 : 0.0,
+    home_back_sensor_active() ? 1.0 : 0.0,
+    home_left_sensor_active() ? 1.0 : 0.0,
+    static_cast<double>(home_back_node_),
+    home_back_input_b_ ? 1.0 : 0.0,
+    home_back_input_active_high_ ? 1.0 : 0.0,
+    static_cast<double>(home_left_node_),
+    home_left_input_b_ ? 1.0 : 0.0,
+    home_left_input_active_high_ ? 1.0 : 0.0,
+  };
+  home_sensors_pub_->publish(msg);
 }
 
 void GantryController::pose_sync_hz_callback(
@@ -546,15 +790,17 @@ void GantryController::joy_callback(const sensor_msgs::msg::Joy::SharedPtr msg)
       zv_dir_y_ = (std::abs(ly) >= std::abs(lx)) ? (ly > 0 ? 1.0 : -1.0) : 0.0;
       zv_state_ = ZvState::RAMP_UP_1;
       zv_transition_time_ = std::chrono::steady_clock::now();
-      RCLCPP_INFO(get_logger(), "ZV start: dir=(%.0f, %.0f)", zv_dir_x_, zv_dir_y_);
+      RCLCPP_INFO(get_logger(), "ZVD start: dir=(%.0f, %.0f)", zv_dir_x_, zv_dir_y_);
     }
 
     if (!stick_active && zv_button_held_) {
-      // Stick just released — start ZV ramp down
-      if (zv_state_ == ZvState::FULL_SPEED || zv_state_ == ZvState::RAMP_UP_1) {
+      // Stick just released — start ZVD ramp down
+      if (zv_state_ == ZvState::FULL_SPEED || zv_state_ == ZvState::RAMP_UP_1 ||
+          zv_state_ == ZvState::RAMP_UP_2)
+      {
         zv_state_ = ZvState::RAMP_DOWN_1;
         zv_transition_time_ = std::chrono::steady_clock::now();
-        RCLCPP_INFO(get_logger(), "ZV stop: ramping down");
+        RCLCPP_INFO(get_logger(), "ZVD stop: ramping down");
       }
     }
 
@@ -636,6 +882,19 @@ void GantryController::set_mode_callback(
     restore_motor_limits();
   }
   move_in_progress_ = false;
+
+  // Any explicit mode change cancels an in-progress sensor homing so its state
+  // flags do not linger (previously set_mode IDLE left homing_active_/status
+  // stuck at "seek_left").
+  if (homing_active_ && mode_str != "HOME") {
+    homing_active_ = false;
+    homing_phase_ = HomingPhase::Idle;
+    homing_status_ = "aborted";
+    pending_run_kind_ = PendingRunKind::None;
+    reset_home_input_debounce();
+    RCLCPP_WARN(get_logger(), "Sensor homing aborted by mode change to %s",
+                mode_str.c_str());
+  }
 
   if (mode_str == "IDLE") {
     current_mode_ = Mode::IDLE;
@@ -735,8 +994,9 @@ void GantryController::set_mode_callback(
     current_mode_ = Mode::ZV_JOG;
     zv_state_ = ZvState::IDLE;
     zv_button_held_ = false;
-    // Use jog_speed_preset for T and A override if provided
-    RCLCPP_INFO(get_logger(), "ZV_JOG mode. T=%.3fs A=%.0fmm/s. D-pad left to move.", zv_T_, zv_A_*1000);
+    RCLCPP_INFO(
+      get_logger(), "ZV_JOG mode (robust ZVD shaper). T=%.3fs zeta=%.3f. Hold LB + stick to move.",
+      zv_T_, zv_zeta_);
   } else {
     response->success = false;
     response->message = "Unknown mode: " + mode_str;
@@ -851,6 +1111,23 @@ void GantryController::clear_estop_callback(
   const std::shared_ptr<std_srvs::srv::Trigger::Request>,
   std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
+  if (hardware_estop_enable_) {
+    try {
+      hardware_estop_input_active_ = hardware_estop_sensor_active();
+    } catch (...) {
+      hardware_estop_input_active_ = true;
+      response->success = false;
+      response->message =
+        "Cannot clear E-stop: failed to read the physical E-stop input.";
+      return;
+    }
+    if (hardware_estop_input_active_) {
+      response->success = false;
+      response->message =
+        "Cannot clear E-stop while the physical switch is pressed/open.";
+      return;
+    }
+  }
   clear_emergency_stop();
   payload_limit_tripped_ = false;
   workspace_limit_tripped_ = false;
@@ -916,6 +1193,13 @@ void GantryController::enable_callback(
   const std::shared_ptr<std_srvs::srv::Trigger::Request>,
   std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
+  if (estop_active_ || hardware_estop_input_active_) {
+    response->success = false;
+    response->message = hardware_estop_input_active_
+      ? "Cannot enable: physical E-stop is pressed/open. Release it, then Clear E-stop."
+      : "Cannot enable: E-stop is latched. Clear E-stop first.";
+    return;
+  }
   if (enable_motors()) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (current_mode_ == Mode::TRAJ && !traj_running_ && !homing_active_) {
@@ -953,6 +1237,55 @@ void GantryController::disable_callback(
   current_mode_ = Mode::IDLE;
   response->success = true;
   response->message = "Motors disabled.";
+}
+
+void GantryController::force_home_callback(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  if (homing_active_) {
+    response->success = false;
+    response->message = "Sensor homing in progress — wait for it to finish.";
+    return;
+  }
+  if (move_in_progress_ ||
+      current_mode_ == Mode::CSV ||
+      current_mode_ == Mode::TRAJ ||
+      current_mode_ == Mode::MISSION ||
+      current_mode_ == Mode::ZV_JOG)
+  {
+    response->success = false;
+    response->message =
+      "Cannot force-home while a move is active. Stop (mode IDLE) first.";
+    return;
+  }
+
+  if (!set_home_reference_here()) {
+    response->success = false;
+    response->message = "Failed to read motor encoders; home reference unchanged.";
+    return;
+  }
+
+  if (motors_enabled_ && !estop_active_) {
+    send_velocity_synced(0.0, 0.0);
+  }
+  current_mode_ = Mode::IDLE;
+
+  RCLCPP_WARN(get_logger(),
+              "FORCE HOME: current position set as software home (no seek). "
+              "Offsets A=%d B=%d bias (%.3f, %.3f) m → cart (0, 0)",
+              home_offset_a_, home_offset_b_,
+              homing_cart_bias_x_, homing_cart_bias_y_);
+
+  char buf[192];
+  snprintf(
+    buf, sizeof(buf),
+    "Home forced at current position (no seek). cart -> (0, 0). "
+    "Offsets A=%d B=%d.%s",
+    home_offset_a_, home_offset_b_,
+    estop_active_ ? " NOTE: E-stop still active - clear it before moving." : "");
+  response->success = true;
+  response->message = buf;
 }
 
 // ============================================================================
@@ -1016,41 +1349,50 @@ void GantryController::fail_homing(const std::string & reason)
   error_count_++;
 }
 
-void GantryController::finalize_homing_success()
+bool GantryController::set_home_reference_here()
 {
-  double raw_x = 0.0;
-  double raw_y = 0.0;
   try {
     home_offset_a_ = static_cast<int32_t>(node_a_->Motion.PosnMeasured.Value());
     home_offset_b_ = static_cast<int32_t>(node_b_->Motion.PosnMeasured.Value());
 
-    const int32_t pos_a = static_cast<int32_t>(node_a_->Motion.PosnMeasured.Value()) - home_offset_a_;
-    const int32_t pos_b = static_cast<int32_t>(node_b_->Motion.PosnMeasured.Value()) - home_offset_b_;
-    motor_a_pos_rad_ = (pos_a / COUNTS_PER_REV) * 2.0 * M_PI;
-    motor_b_pos_rad_ = (pos_b / COUNTS_PER_REV) * 2.0 * M_PI;
-
-    forward_cartesian_unbiased(raw_x, raw_y);
+    // Motor angles are zero at the freshly captured offsets; compute the FK
+    // bias so the reported cart pose reads (0, 0) at this position even though
+    // the physical FK origin is rarely exactly (0, 0).
+    motor_a_pos_rad_ = 0.0;
+    motor_b_pos_rad_ = 0.0;
+    forward_cartesian_unbiased(homing_cart_bias_x_, homing_cart_bias_y_);
   } catch (...) {
-    fail_homing("encoder read after homing");
-    return;
+    return false;
   }
 
   homed_ = true;
-  homing_active_ = false;
   homing_status_ = "done";
   homing_phase_ = HomingPhase::Idle;
-  current_mode_ = mode_before_homing_;
 
-  // Software workspace origin at home sensors (physical FK rarely exactly 0,0).
-  homing_cart_bias_x_ = raw_x;
-  homing_cart_bias_y_ = raw_y;
   cart_x_m_ = 0.0;
   cart_y_m_ = 0.0;
   cart_vx_ms_ = 0.0;
   cart_vy_ms_ = 0.0;
+  cart_vx_measured_ms_ = 0.0;
+  cart_vy_measured_ms_ = 0.0;
+  cart_vx_from_position_ms_ = 0.0;
+  cart_vy_from_position_ms_ = 0.0;
+  position_velocity_initialized_ = false;
+  workspace_limit_tripped_ = false;
+  return true;
+}
+
+void GantryController::finalize_homing_success()
+{
+  if (!set_home_reference_here()) {
+    fail_homing("encoder read after homing");
+    return;
+  }
+
+  homing_active_ = false;
+  current_mode_ = mode_before_homing_;
 
   // Homing seek can trip workspace E-stop before bias is applied; safe to clear at home.
-  workspace_limit_tripped_ = false;
   if (estop_active_) {
     clear_emergency_stop();
   }
@@ -1099,8 +1441,7 @@ void GantryController::reset_home_input_debounce()
   homing_back_debounce_count_ = 0;
 }
 
-bool GantryController::read_home_hub_input(
-  size_t node_index, bool input_b, bool active_high)
+bool GantryController::read_hub_input_raw(size_t node_index, bool input_b)
 {
   sFnd::INode * node = nullptr;
   if (node_index == 0) {
@@ -1112,7 +1453,13 @@ bool GantryController::read_home_hub_input(
   }
   node->Status.RT.Refresh();
   const auto & cpm = node->Status.RT.Value().cpm;
-  const bool raw = input_b ? (cpm.InB != 0) : (cpm.InA != 0);
+  return input_b ? (cpm.InB != 0) : (cpm.InA != 0);
+}
+
+bool GantryController::read_home_hub_input(
+  size_t node_index, bool input_b, bool active_high)
+{
+  const bool raw = read_hub_input_raw(node_index, input_b);
   return active_high ? raw : !raw;
 }
 
@@ -1126,6 +1473,54 @@ bool GantryController::home_back_sensor_active()
 {
   return read_home_hub_input(
     home_back_node_, home_back_input_b_, home_back_input_active_high_);
+}
+
+bool GantryController::hardware_estop_sensor_active()
+{
+  return read_home_hub_input(
+    hardware_estop_node_, hardware_estop_input_b_, hardware_estop_active_high_);
+}
+
+void GantryController::monitor_hardware_estop()
+{
+  if (!hardware_estop_enable_) {
+    hardware_estop_input_active_ = false;
+    hardware_estop_debounce_count_ = 0;
+    return;
+  }
+
+  bool active = true;  // Fail safe if the SC4 input cannot be read.
+  try {
+    active = hardware_estop_sensor_active();
+  } catch (...) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Physical E-stop input read failed; treating it as active");
+  }
+
+  const bool was_active = hardware_estop_input_active_;
+  hardware_estop_input_active_ = active;
+  if (active) {
+    hardware_estop_debounce_count_ = std::min(
+      hardware_estop_debounce_count_ + 1, hardware_estop_debounce_ticks_ + 1);
+    if (hardware_estop_debounce_count_ >= hardware_estop_debounce_ticks_ &&
+        !estop_active_)
+    {
+      RCLCPP_ERROR(
+        get_logger(),
+        "PHYSICAL E-STOP ACTIVE on node%zu input%c; stopping both axes now",
+        hardware_estop_node_, hardware_estop_input_b_ ? 'B' : 'A');
+      emergency_stop();
+    }
+    return;
+  }
+
+  hardware_estop_debounce_count_ = 0;
+  if (was_active && estop_active_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Physical E-stop released; stop remains latched until explicit Clear E-stop");
+  }
 }
 
 bool GantryController::home_sensors_both_active_debounced()
@@ -1169,8 +1564,13 @@ void GantryController::execute_homing()
 void GantryController::execute_homing_sensor_inputs()
 {
   const double seek_speed = std::clamp(0.5 * mission_move_vel_ms_, 0.005, MAX_VEL_MS);
-  const double vx_seek = -seek_speed;  // left
-  const double vy_seek = -seek_speed;  // back
+  // Magnitude comes from mission_move_vel_ms; direction comes from the sign of
+  // homing_seek_vx_ms / homing_seek_vy_ms so a mis-placed home switch can be
+  // reached by flipping the param sign (no rebuild).
+  const double vx_dir = (homing_seek_vx_ms_ >= 0.0) ? 1.0 : -1.0;
+  const double vy_dir = (homing_seek_vy_ms_ >= 0.0) ? 1.0 : -1.0;
+  const double vx_seek = vx_dir * seek_speed;  // left / X approach
+  const double vy_seek = vy_dir * seek_speed;  // back / Y approach
 
   try {
     switch (homing_phase_) {
@@ -1241,6 +1641,17 @@ void GantryController::execute_homing_sensor_inputs()
             break;
           }
         }
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "seek_back: driving Y @ %.3f m/s | back_raw(n%zu%c)=%d back_active=%d "
+          "left_raw(n%zu%c)=%d left_active=%d | cart x=%.3f y=%.3f",
+          vy_seek, home_back_node_, home_back_input_b_ ? 'B' : 'A',
+          read_hub_input_raw(home_back_node_, home_back_input_b_) ? 1 : 0,
+          home_back_sensor_active() ? 1 : 0,
+          home_left_node_, home_left_input_b_ ? 'B' : 'A',
+          read_hub_input_raw(home_left_node_, home_left_input_b_) ? 1 : 0,
+          home_left_sensor_active() ? 1 : 0,
+          cart_x_m_, cart_y_m_);
         // Lab frame: origin bottom-left, +Y up → back = negative Y only (no X during back seek).
         send_cartesian_velocity(0.0, vy_seek);
         break;
@@ -1261,9 +1672,9 @@ void GantryController::execute_homing_sensor_inputs()
           }
           if (homing_left_debounce_count_ >= homing_input_debounce_ticks_) {
             send_cartesian_velocity(0.0, 0.0);
-            reset_home_input_debounce();
-            if (home_sensors_both_active_debounced()) {
+            if (home_back_sensor_active()) {
               RCLCPP_INFO(get_logger(), "Left sensor active — both home inputs on.");
+              reset_home_input_debounce();
               homing_phase_ = HomingPhase::Finalize;
             } else {
               fail_homing("left sensor reached but back sensor not active");
@@ -1271,7 +1682,17 @@ void GantryController::execute_homing_sensor_inputs()
             break;
           }
         }
-        // Left = negative X only (after back sensor is satisfied).
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "seek_left: driving X @ %.3f m/s | left_raw(n%zu%c)=%d left_active=%d "
+          "back_raw(n%zu%c)=%d back_active=%d | cart x=%.3f y=%.3f",
+          vx_seek, home_left_node_, home_left_input_b_ ? 'B' : 'A',
+          read_hub_input_raw(home_left_node_, home_left_input_b_) ? 1 : 0,
+          home_left_sensor_active() ? 1 : 0,
+          home_back_node_, home_back_input_b_ ? 'B' : 'A',
+          read_hub_input_raw(home_back_node_, home_back_input_b_) ? 1 : 0,
+          home_back_sensor_active() ? 1 : 0,
+          cart_x_m_, cart_y_m_);
         send_cartesian_velocity(vx_seek, 0.0);
         break;
 
@@ -1404,50 +1825,84 @@ void GantryController::execute_jog()
 
 void GantryController::execute_zv_jog()
 {
-  // Update parameters dynamically
+  // Update parameters dynamically (adaptive sway-ID nodes can push zv_T live)
   zv_T_ = get_parameter("zv_T").as_double();
+  zv_zeta_ = get_parameter("zv_zeta").as_double();
 
-  double vx = 0.0, vy = 0.0;
+  // Robust ZVD (Zero-Vibration-Derivative) 3-impulse shaper. Unlike a plain
+  // ZV shaper, ZVD also zeros the *derivative* of residual vibration with
+  // respect to the payload's natural frequency, so it stays low-vibration
+  // even if the real sway frequency drifts from the modeled one (e.g. rope
+  // length / payload mass changes). zv_T_ is the impulse spacing, i.e. half
+  // the damped oscillation period T = pi / omega_d.
+  double zeta = std::clamp(zv_zeta_, 0.0, 0.99);
+  double wd_factor = std::sqrt(std::max(1.0 - zeta * zeta, 1e-12));
+  double K = std::exp(-M_PI * zeta / wd_factor);
+  double denom = 1.0 + 2.0 * K + K * K;
+  double A0 = 1.0 / denom;
+  double A1 = 2.0 * K / denom;
+  // A2 = K * K / denom is implicit: A0 + A1 + A2 == 1 once FULL_SPEED is reached.
+
+  double gain = 0.0;
 
   switch (zv_state_) {
     case ZvState::IDLE:
-      vx = 0.0;
-      vy = 0.0;
+      gain = 0.0;
       break;
 
     case ZvState::RAMP_UP_1: {
-      // Half speed for T seconds
-      vx = zv_dir_x_ * 0.5 * JOG_SPEEDS[jog_speed_preset_];
-      vy = zv_dir_y_ * 0.5 * JOG_SPEEDS[jog_speed_preset_];
+      // First impulse: A0 of full speed for T seconds
+      gain = A0;
+      auto elapsed = std::chrono::steady_clock::now() - zv_transition_time_;
+      if (std::chrono::duration<double>(elapsed).count() >= zv_T_) {
+        zv_state_ = ZvState::RAMP_UP_2;
+        zv_transition_time_ = std::chrono::steady_clock::now();
+      }
+      break;
+    }
+
+    case ZvState::RAMP_UP_2: {
+      // Second impulse: A0 + A1 of full speed for T seconds
+      gain = A0 + A1;
       auto elapsed = std::chrono::steady_clock::now() - zv_transition_time_;
       if (std::chrono::duration<double>(elapsed).count() >= zv_T_) {
         zv_state_ = ZvState::FULL_SPEED;
-        RCLCPP_INFO(get_logger(), "ZV: full speed");
+        RCLCPP_INFO(get_logger(), "ZVD: full speed");
       }
       break;
     }
 
     case ZvState::FULL_SPEED:
-      // Full speed until button released
-      vx = zv_dir_x_ * JOG_SPEEDS[jog_speed_preset_];
-      vy = zv_dir_y_ * JOG_SPEEDS[jog_speed_preset_];
+      // Third impulse: full speed until button released
+      gain = 1.0;
       break;
 
     case ZvState::RAMP_DOWN_1: {
-      // Half speed for T seconds
-      vx = zv_dir_x_ * 0.5 * JOG_SPEEDS[jog_speed_preset_];
-      vy = zv_dir_y_ * 0.5 * JOG_SPEEDS[jog_speed_preset_];
+      // Mirror of RAMP_UP_2: drop by A2 for T seconds
+      gain = 1.0 - A0;
+      auto elapsed = std::chrono::steady_clock::now() - zv_transition_time_;
+      if (std::chrono::duration<double>(elapsed).count() >= zv_T_) {
+        zv_state_ = ZvState::RAMP_DOWN_2;
+        zv_transition_time_ = std::chrono::steady_clock::now();
+      }
+      break;
+    }
+
+    case ZvState::RAMP_DOWN_2: {
+      // Mirror of RAMP_UP_1: drop by A1 for T seconds, then stop
+      gain = 1.0 - A0 - A1;
       auto elapsed = std::chrono::steady_clock::now() - zv_transition_time_;
       if (std::chrono::duration<double>(elapsed).count() >= zv_T_) {
         zv_state_ = ZvState::IDLE;
-        vx = 0.0;
-        vy = 0.0;
-        RCLCPP_INFO(get_logger(), "ZV: stopped");
+        gain = 0.0;
+        RCLCPP_INFO(get_logger(), "ZVD: stopped");
       }
       break;
     }
   }
 
+  double vx = zv_dir_x_ * gain * JOG_SPEEDS[jog_speed_preset_];
+  double vy = zv_dir_y_ * gain * JOG_SPEEDS[jog_speed_preset_];
   send_cartesian_velocity(vx, vy);
 }
 
@@ -1484,6 +1939,8 @@ void GantryController::execute_csv()
 
 void GantryController::clear_traj_profile()
 {
+  timed_profile_armed_ = false;
+  precise_profile_timing_ = false;
   traj_profile_.clear();
   traj_index_ = 0;
   traj_profile_loaded_ = false;
@@ -1491,6 +1948,100 @@ void GantryController::clear_traj_profile()
   traj_realtime_active_ = false;
   stream_vx_mm_s_ = 0.0;
   stream_vy_mm_s_ = 0.0;
+  reset_traj_write_cache();
+}
+
+void GantryController::execute_timed_profile_callback(
+  const std::shared_ptr<gantry_control::srv::ExecuteTimedProfile::Request> request,
+  std::shared_ptr<gantry_control::srv::ExecuteTimedProfile::Response> response)
+{
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  response->accepted_start_time = request->start_time;
+
+  if (current_mode_ != Mode::TRAJ || !motors_enabled_ || !homed_ || estop_active_ ||
+      hardware_estop_input_active_ || homing_active_)
+  {
+    response->success = false;
+    response->message =
+      "Timed profile requires enabled, homed, non-E-stopped TRAJ mode";
+    return;
+  }
+
+  const size_t count = request->time_s.size();
+  if (count < 2 || count > 16 || request->vx_mm_s.size() != count ||
+      request->vy_mm_s.size() != count)
+  {
+    response->success = false;
+    response->message = "Timed profile arrays must have equal length in [2, 16]";
+    return;
+  }
+  if (std::abs(request->time_s.front()) > 1.0e-9) {
+    response->success = false;
+    response->message = "Timed profile must begin at time_s=0";
+    return;
+  }
+  for (size_t index = 0; index < count; ++index) {
+    const double t = request->time_s[index];
+    const double vx = request->vx_mm_s[index];
+    const double vy = request->vy_mm_s[index];
+    if (!std::isfinite(t) || !std::isfinite(vx) || !std::isfinite(vy) ||
+        t < 0.0 || std::abs(vx) > 1000.0 * MAX_VEL_MS ||
+        std::abs(vy) > 1000.0 * MAX_VEL_MS ||
+        (index > 0 && t <= request->time_s[index - 1]))
+    {
+      response->success = false;
+      response->message = "Timed profile has invalid time ordering or velocity";
+      return;
+    }
+  }
+  if (request->time_s.back() > 60.0 ||
+      std::abs(request->vx_mm_s.back()) > 1.0e-9 ||
+      std::abs(request->vy_mm_s.back()) > 1.0e-9)
+  {
+    response->success = false;
+    response->message = "Timed profile must end at zero velocity within 60 seconds";
+    return;
+  }
+
+  const double requested_start_s =
+    static_cast<double>(request->start_time.sec) +
+    1.0e-9 * static_cast<double>(request->start_time.nanosec);
+  const double lead_s = requested_start_s - now().seconds();
+  if (!std::isfinite(lead_s) || lead_s < 0.10 || lead_s > 5.0) {
+    response->success = false;
+    response->message = "Timed profile start must be 0.10 to 5.0 seconds in the future";
+    return;
+  }
+
+  traj_profile_.clear();
+  traj_profile_.reserve(count);
+  for (size_t index = 0; index < count; ++index) {
+    traj_profile_.push_back(CsvEntry{
+      request->time_s[index], request->vx_mm_s[index], request->vy_mm_s[index]});
+  }
+  traj_index_ = 0;
+  traj_profile_loaded_ = true;
+  traj_abort_ = false;
+  timed_profile_start_time_ =
+    std::chrono::steady_clock::now() + std::chrono::duration_cast<
+      std::chrono::steady_clock::duration>(std::chrono::duration<double>(lead_s));
+  timed_profile_start_ros_s_ = requested_start_s;
+  timed_profile_armed_ = true;
+  precise_profile_timing_ = true;
+  traj_running_ = true;
+  traj_realtime_active_ = true;
+  stream_vx_mm_s_ = 0.0;
+  stream_vy_mm_s_ = 0.0;
+  last_cmd_time_ = std::chrono::steady_clock::now();
+  send_traj_cartesian_velocity(0.0, 0.0, true);
+
+  response->success = true;
+  response->message =
+    "Controller-timed profile armed for absolute start time";
+  RCLCPP_INFO(
+    get_logger(),
+    "Controller-timed TRAJ armed: lead=%.3fs knots=%zu duration=%.6fs",
+    lead_s, count, request->time_s.back());
 }
 
 void GantryController::publish_motion_start()
@@ -1530,21 +2081,25 @@ void GantryController::do_start_traj_execution()
   traj_index_ = 0;
   traj_start_time_ = std::chrono::steady_clock::now();
   traj_running_ = true;
+  reset_traj_write_cache();
   publish_motion_start();
   RCLCPP_INFO(get_logger(),
               "TRAJ buffered playback started (%zu segments) — profile time t=0",
               traj_profile_.size());
 }
 
-void GantryController::do_start_traj_realtime()
+void GantryController::do_start_traj_realtime(bool reset_stream_command)
 {
   traj_realtime_active_ = true;
   traj_index_ = 0;
   traj_start_time_ = std::chrono::steady_clock::now();
   traj_running_ = true;
-  stream_vx_mm_s_ = 0.0;
-  stream_vy_mm_s_ = 0.0;
+  if (reset_stream_command) {
+    stream_vx_mm_s_ = 0.0;
+    stream_vy_mm_s_ = 0.0;
+  }
   last_cmd_time_ = std::chrono::steady_clock::now();
+  reset_traj_write_cache();
   publish_motion_start();
   RCLCPP_INFO(get_logger(),
               "TRAJ realtime started — publish STREAM on /traj_cmd (vx_mm_s, vy_mm_s)");
@@ -1567,7 +2122,7 @@ void GantryController::start_traj_execution()
   do_start_traj_execution();
 }
 
-void GantryController::start_traj_realtime()
+void GantryController::start_traj_realtime(bool reset_stream_command)
 {
   if (homing_active_) {
     RCLCPP_WARN(get_logger(), "Homing in progress — TRAJ realtime deferred");
@@ -1577,7 +2132,7 @@ void GantryController::start_traj_realtime()
     begin_homing(PendingRunKind::TrajRealtime, Mode::TRAJ);
     return;
   }
-  do_start_traj_realtime();
+  do_start_traj_realtime(reset_stream_command);
 }
 
 void GantryController::publish_traj_playback_realtime(
@@ -1645,11 +2200,25 @@ void GantryController::traj_cmd_callback(
   }
 
   if (msg->command == gantry_control::msg::TrajCmd::STREAM) {
+    const bool changed =
+      !traj_received_velocity_valid_ ||
+      std::abs(msg->vx_mm_s - traj_received_vx_mm_s_) > 1.0e-9 ||
+      std::abs(msg->vy_mm_s - traj_received_vy_mm_s_) > 1.0e-9;
+    if (changed) {
+      traj_stream_seq_++;
+      traj_source_stamp_s_ =
+        static_cast<double>(msg->header.stamp.sec) +
+        1.0e-9 * static_cast<double>(msg->header.stamp.nanosec);
+      traj_rx_stamp_s_ = now().seconds();
+      traj_received_vx_mm_s_ = msg->vx_mm_s;
+      traj_received_vy_mm_s_ = msg->vy_mm_s;
+      traj_received_velocity_valid_ = true;
+    }
     stream_vx_mm_s_ = msg->vx_mm_s;
     stream_vy_mm_s_ = msg->vy_mm_s;
     last_cmd_time_ = std::chrono::steady_clock::now();
     if (!traj_running_ && motors_enabled_ && traj_realtime_enable_) {
-      start_traj_realtime();
+      start_traj_realtime(false);
     }
     return;
   }
@@ -1674,6 +2243,7 @@ void GantryController::execute_traj()
 {
   if (traj_abort_) {
     send_velocity_synced(0.0, 0.0);
+    reset_traj_write_cache();
     traj_running_ = false;
     traj_abort_ = false;
     clear_traj_profile();
@@ -1690,6 +2260,34 @@ void GantryController::execute_traj()
     return;
   }
 
+  // A timed profile is loaded atomically while realtime STREAM is holding
+  // zero.  Let the 100 Hz loop that arrives just before the requested epoch
+  // wait the final fraction of a cycle, then own every subsequent switch on
+  // this same steady clock.  The wait is capped near one normal control period
+  // so physical E-stop polling is not delayed beyond its existing cadence.
+  if (timed_profile_armed_) {
+    auto steady_now = std::chrono::steady_clock::now();
+    if (steady_now < timed_profile_start_time_) {
+      const double remaining_s = std::chrono::duration<double>(
+        timed_profile_start_time_ - steady_now).count();
+      if (remaining_s <= 0.012) {
+        std::this_thread::sleep_until(timed_profile_start_time_);
+      } else {
+        send_traj_cartesian_velocity(0.0, 0.0);
+        return;
+      }
+    }
+    timed_profile_armed_ = false;
+    traj_realtime_active_ = false;
+    traj_start_time_ = timed_profile_start_time_;
+    traj_index_ = 0;
+    reset_traj_write_cache();
+    publish_motion_start();
+    RCLCPP_INFO(
+      get_logger(), "Controller-timed TRAJ started (%zu knots)",
+      traj_profile_.size());
+  }
+
   auto elapsed = std::chrono::steady_clock::now() - traj_start_time_;
   double t = std::chrono::duration<double>(elapsed).count();
 
@@ -1704,7 +2302,17 @@ void GantryController::execute_traj()
       vy_ms = stream_vy_mm_s_ / 1000.0;
     }
     publish_traj_playback_realtime(t, stream_vx_mm_s_, stream_vy_mm_s_);
-    send_cartesian_velocity(vx_ms, vy_ms);
+    const bool new_stream_command = traj_stream_seq_ != traj_applied_seq_;
+    if (new_stream_command) {
+      traj_apply_begin_stamp_s_ = now().seconds();
+    }
+    const bool write_ok = send_traj_cartesian_velocity(vx_ms, vy_ms);
+    if (new_stream_command && write_ok) {
+      traj_apply_done_stamp_s_ = now().seconds();
+      traj_applied_seq_ = traj_stream_seq_;
+      traj_applied_vx_mm_s_ = 1000.0 * vx_ms;
+      traj_applied_vy_mm_s_ = 1000.0 * vy_ms;
+    }
     return;
   }
 
@@ -1713,8 +2321,9 @@ void GantryController::execute_traj()
     return;
   }
 
-  if (t > traj_profile_.back().time_s) {
+  if (t > traj_profile_.back().time_s && !precise_profile_timing_) {
     send_velocity_synced(0.0, 0.0);
+    reset_traj_write_cache();
     traj_running_ = false;
     traj_profile_loaded_ = false;
     clear_traj_profile();
@@ -1723,6 +2332,23 @@ void GantryController::execute_traj()
     return;
   }
 
+  if (precise_profile_timing_ && traj_index_ < traj_profile_.size() - 1) {
+    const auto next_switch = traj_start_time_ + std::chrono::duration_cast<
+      std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(traj_profile_[traj_index_ + 1].time_s));
+    const auto steady_now = std::chrono::steady_clock::now();
+    if (steady_now < next_switch) {
+      const double remaining_s =
+        std::chrono::duration<double>(next_switch - steady_now).count();
+      if (remaining_s <= 0.012) {
+        std::this_thread::sleep_until(next_switch);
+        elapsed = std::chrono::steady_clock::now() - traj_start_time_;
+        t = std::chrono::duration<double>(elapsed).count();
+      }
+    }
+  }
+
+  const size_t previous_index = traj_index_;
   while (traj_index_ < traj_profile_.size() - 1 &&
          traj_profile_[traj_index_ + 1].time_s <= t) {
     traj_index_++;
@@ -1732,7 +2358,45 @@ void GantryController::execute_traj()
 
   double vx_ms = traj_profile_[traj_index_].vx_mm_s / 1000.0;
   double vy_ms = traj_profile_[traj_index_].vy_mm_s / 1000.0;
-  send_cartesian_velocity(vx_ms, vy_ms);
+  // A ClearPath velocity command persists until replaced.  For a precisely
+  // timed profile, write only at the initial knot and actual switches; motor
+  // API calls between knots merely consume several milliseconds and increase
+  // boundary jitter.  Legacy buffered playback retains its configured write
+  // behavior.
+  if (precise_profile_timing_ &&
+      (!last_sent_traj_velocity_valid_ || traj_index_ != previous_index))
+  {
+    // Reuse the latency diagnostic record for controller-owned knots.  For a
+    // buffered profile the source/receive epoch is the nominal scheduled
+    // boundary; apply_begin-source is therefore the actual switch-time error.
+    traj_stream_seq_++;
+    traj_source_stamp_s_ =
+      timed_profile_start_ros_s_ + traj_profile_[traj_index_].time_s;
+    traj_rx_stamp_s_ = traj_source_stamp_s_;
+    traj_received_vx_mm_s_ = 1000.0 * vx_ms;
+    traj_received_vy_mm_s_ = 1000.0 * vy_ms;
+    traj_apply_begin_stamp_s_ = now().seconds();
+    if (send_traj_cartesian_velocity(vx_ms, vy_ms, true)) {
+      traj_apply_done_stamp_s_ = now().seconds();
+      traj_applied_seq_ = traj_stream_seq_;
+      traj_applied_vx_mm_s_ = 1000.0 * vx_ms;
+      traj_applied_vy_mm_s_ = 1000.0 * vy_ms;
+    }
+  } else if (!precise_profile_timing_) {
+    send_traj_cartesian_velocity(vx_ms, vy_ms);
+  }
+
+  if (precise_profile_timing_ &&
+      traj_index_ == traj_profile_.size() - 1 &&
+      t >= traj_profile_.back().time_s)
+  {
+    reset_traj_write_cache();
+    traj_running_ = false;
+    traj_profile_loaded_ = false;
+    clear_traj_profile();
+    current_mode_ = Mode::IDLE;
+    RCLCPP_INFO(get_logger(), "Controller-timed TRAJ complete → IDLE");
+  }
 }
 
 void GantryController::execute_mission()
@@ -1764,8 +2428,11 @@ bool GantryController::init_hardware()
       return false;
     }
 
-    RCLCPP_INFO(get_logger(), "Found SC4-HUB on %s", comHubPorts[0].c_str());
-    sys_mgr_->ComHubPort(0, comHubPorts[0].c_str());
+    RCLCPP_INFO(
+      get_logger(), "Found SC4-HUB on %s; opening at %d baud",
+      comHubPorts[0].c_str(), teknic_baud_rate_);
+    sys_mgr_->ComHubPort(
+      0, comHubPorts[0].c_str(), static_cast<netRates>(teknic_baud_rate_));
     sys_mgr_->PortsOpen(1);
 
     port_ = &sys_mgr_->Ports(0);
@@ -1828,7 +2495,23 @@ void GantryController::shutdown_hardware()
 
 bool GantryController::enable_motors()
 {
-  if (!hardware_initialized_) return false;
+  if (!hardware_initialized_ || estop_active_) {
+    return false;
+  }
+  if (hardware_estop_enable_) {
+    try {
+      hardware_estop_input_active_ = hardware_estop_sensor_active();
+    } catch (...) {
+      hardware_estop_input_active_ = true;
+      RCLCPP_ERROR(
+        get_logger(), "Cannot enable motors: physical E-stop input read failed");
+    }
+    if (hardware_estop_input_active_) {
+      RCLCPP_ERROR(
+        get_logger(), "Cannot enable motors: physical E-stop is pressed/open");
+      return false;
+    }
+  }
   try {
     // Clear alerts and stops
     node_a_->Status.AlertsClear();
@@ -1876,6 +2559,22 @@ void GantryController::disable_motors()
 void GantryController::emergency_stop()
 {
   estop_active_ = true;
+  // Cancel every present and queued motion source first. NodeStop below halts
+  // motion already in progress; these resets prevent any mode from resuming it
+  // when the physical input is released.
+  traj_abort_ = true;
+  clear_traj_profile();
+  move_in_progress_ = false;
+  homing_active_ = false;
+  homing_phase_ = HomingPhase::Idle;
+  homing_status_ = "estopped";
+  pending_run_kind_ = PendingRunKind::None;
+  reset_home_input_debounce();
+  jog_vx_ = 0.0;
+  jog_vy_ = 0.0;
+  joy_enable_held_ = false;
+  zv_state_ = ZvState::IDLE;
+  zv_button_held_ = false;
   try {
     if (node_a_) node_a_->Motion.NodeStop(STOP_TYPE_ABRUPT);
     if (node_b_) node_b_->Motion.NodeStop(STOP_TYPE_ABRUPT);
@@ -1914,9 +2613,13 @@ void GantryController::forward_cartesian_unbiased(double & x_m, double & y_m)
 void GantryController::read_encoders()
 {
   try {
+    const auto t0 = std::chrono::steady_clock::now();
+
     // Read raw encoder counts
     int32_t raw_a = static_cast<int32_t>(node_a_->Motion.PosnMeasured.Value());
+    const auto t1 = std::chrono::steady_clock::now();
     int32_t raw_b = static_cast<int32_t>(node_b_->Motion.PosnMeasured.Value());
+    const auto t2 = std::chrono::steady_clock::now();
 
     // Apply home offsets
     int32_t pos_a = raw_a - home_offset_a_;
@@ -1926,15 +2629,28 @@ void GantryController::read_encoders()
     motor_a_pos_rad_ = (pos_a / COUNTS_PER_REV) * 2.0 * M_PI;
     motor_b_pos_rad_ = (pos_b / COUNTS_PER_REV) * 2.0 * M_PI;
 
-    // Read velocities (RPM → rad/s)
-    double vel_a_rpm = node_a_->Motion.VelMeasured.Value();
-    double vel_b_rpm = node_b_->Motion.VelMeasured.Value();
-    motor_a_vel_rads_ = vel_a_rpm * 2.0 * M_PI / 60.0;
-    motor_b_vel_rads_ = vel_b_rpm * 2.0 * M_PI / 60.0;
+    const bool read_motor_velocity =
+      motor_velocity_read_every_n_ <= 1 ||
+      (motor_velocity_read_counter_ % motor_velocity_read_every_n_) == 0;
+    motor_velocity_read_counter_++;
+
+    auto t3 = t2;
+    auto t4 = t2;
+    if (read_motor_velocity) {
+      // Read velocities (RPM → rad/s). These are useful diagnostics, but each
+      // Value() call is an SC4-HUB transaction, so we allow sparse polling.
+      double vel_a_rpm = node_a_->Motion.VelMeasured.Value();
+      t3 = std::chrono::steady_clock::now();
+      double vel_b_rpm = node_b_->Motion.VelMeasured.Value();
+      t4 = std::chrono::steady_clock::now();
+      motor_a_vel_rads_ = vel_a_rpm * 2.0 * M_PI / 60.0;
+      motor_b_vel_rads_ = vel_b_rpm * 2.0 * M_PI / 60.0;
+      forward_velocity(
+        motor_a_vel_rads_, motor_b_vel_rads_, cart_vx_measured_ms_, cart_vy_measured_ms_);
+    }
 
     // Compute Cartesian state (workspace frame; home sensors → 0,0 after bias)
     forward_kinematics(motor_a_pos_rad_, motor_b_pos_rad_, cart_x_m_, cart_y_m_);
-    forward_velocity(motor_a_vel_rads_, motor_b_vel_rads_, cart_vx_ms_, cart_vy_ms_);
     cart_x_m_ -= homing_cart_bias_x_;
     cart_y_m_ -= homing_cart_bias_y_;
 
@@ -1942,6 +2658,48 @@ void GantryController::read_encoders()
       cart_x_m_ = 0.0;
       cart_y_m_ = 0.0;
     }
+
+    const auto velocity_time = std::chrono::steady_clock::now();
+    if (position_velocity_initialized_) {
+      const double dt_s =
+        std::chrono::duration<double>(velocity_time - last_position_velocity_time_).count();
+      if (dt_s > 1.0e-6 && dt_s < 0.5) {
+        const double raw_vx = (cart_x_m_ - last_cart_x_for_velocity_m_) / dt_s;
+        const double raw_vy = (cart_y_m_ - last_cart_y_for_velocity_m_) / dt_s;
+        const double alpha = position_velocity_alpha_;
+        cart_vx_from_position_ms_ =
+          alpha * raw_vx + (1.0 - alpha) * cart_vx_from_position_ms_;
+        cart_vy_from_position_ms_ =
+          alpha * raw_vy + (1.0 - alpha) * cart_vy_from_position_ms_;
+      }
+    } else {
+      cart_vx_from_position_ms_ = 0.0;
+      cart_vy_from_position_ms_ = 0.0;
+      position_velocity_initialized_ = true;
+    }
+    last_cart_x_for_velocity_m_ = cart_x_m_;
+    last_cart_y_for_velocity_m_ = cart_y_m_;
+    last_position_velocity_time_ = velocity_time;
+
+    if (cart_velocity_source_ == "position") {
+      cart_vx_ms_ = cart_vx_from_position_ms_;
+      cart_vy_ms_ = cart_vy_from_position_ms_;
+    } else {
+      cart_vx_ms_ = cart_vx_measured_ms_;
+      cart_vy_ms_ = cart_vy_measured_ms_;
+    }
+
+    const auto t5 = std::chrono::steady_clock::now();
+    last_pos_a_read_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    last_pos_b_read_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    last_vel_a_read_ms_ = read_motor_velocity
+      ? std::chrono::duration<double, std::milli>(t3 - t2).count()
+      : 0.0;
+    last_vel_b_read_ms_ = read_motor_velocity
+      ? std::chrono::duration<double, std::milli>(t4 - t3).count()
+      : 0.0;
+    last_read_math_ms_ = std::chrono::duration<double, std::milli>(t5 - t4).count();
+    encoder_read_stamp_s_ = now().seconds();
 
   } catch (...) {
     error_count_++;
@@ -2021,6 +2779,52 @@ bool GantryController::send_cartesian_velocity(double vx_ms, double vy_ms)
   double rpm_a, rpm_b;
   inverse_velocity(vx_ms, vy_ms, rpm_a, rpm_b);
   send_velocity_synced(rpm_a, rpm_b);
+  return true;
+}
+
+void GantryController::reset_traj_write_cache()
+{
+  last_sent_traj_vx_ms_ = 0.0;
+  last_sent_traj_vy_ms_ = 0.0;
+  last_sent_traj_velocity_valid_ = false;
+  last_traj_write_time_ = std::chrono::steady_clock::now();
+}
+
+bool GantryController::send_traj_cartesian_velocity(double vx_ms, double vy_ms, bool force)
+{
+  if (!check_workspace_position()) {
+    return false;
+  }
+  clamp_velocity_to_workspace(vx_ms, vy_ms);
+  vx_ms = std::clamp(vx_ms, -MAX_VEL_MS, MAX_VEL_MS);
+  vy_ms = std::clamp(vy_ms, -MAX_VEL_MS, MAX_VEL_MS);
+
+  if (traj_write_on_change_only_) {
+    const auto now_tp = std::chrono::steady_clock::now();
+    const double deadband_ms = traj_write_deadband_mm_s_ / 1000.0;
+    const bool changed =
+      !last_sent_traj_velocity_valid_ ||
+      std::abs(vx_ms - last_sent_traj_vx_ms_) > deadband_ms ||
+      std::abs(vy_ms - last_sent_traj_vy_ms_) > deadband_ms;
+    const bool keepalive =
+      traj_write_keepalive_s_ > 0.0 &&
+      std::chrono::duration<double>(now_tp - last_traj_write_time_).count()
+        >= traj_write_keepalive_s_;
+
+    if (!force && !changed && !keepalive) {
+      return true;
+    }
+  }
+
+  double rpm_a = 0.0;
+  double rpm_b = 0.0;
+  inverse_velocity(vx_ms, vy_ms, rpm_a, rpm_b);
+  send_velocity_synced(rpm_a, rpm_b);
+
+  last_sent_traj_vx_ms_ = vx_ms;
+  last_sent_traj_vy_ms_ = vy_ms;
+  last_sent_traj_velocity_valid_ = true;
+  last_traj_write_time_ = std::chrono::steady_clock::now();
   return true;
 }
 

@@ -8,7 +8,11 @@ Packages (crane_ws):
 
 Default: encoder off (not plugged in). Enable with start_encoder:=true.
 
-  ros2 launch gantry_control gantry.launch.py start_tracker:=true oak_ip:=192.168.0.153
+The multi-face phase1 tracker runs by default (start_phase1_tracker:=true).
+Do NOT also pass start_tracker:=true — that is the legacy single-tag tracker
+and the two fight over the one OAK-D camera. Pass the camera IP as oak_ip:
+
+  ros2 launch gantry_control gantry.launch.py oak_ip:=192.168.0.153
 """
 import os
 
@@ -17,6 +21,7 @@ from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def _payload_mount_defaults(config_dir):
@@ -69,14 +74,24 @@ def generate_launch_description():
         DeclareLaunchArgument('start_gantry', default_value='true'),
         DeclareLaunchArgument('start_joy', default_value='true'),
         DeclareLaunchArgument('start_tracker', default_value='false'),
+        DeclareLaunchArgument('start_phase1_tracker', default_value='false'),
         DeclareLaunchArgument('start_encoder', default_value='false'),
         DeclareLaunchArgument('encoder_backend', default_value='serial'),
+        DeclareLaunchArgument('encoder_publish_rate_hz', default_value='100.0'),
         DeclareLaunchArgument('start_gantry_frame', default_value='false'),
         DeclareLaunchArgument('start_logger', default_value='true'),
         DeclareLaunchArgument('oak_ip', default_value='192.168.0.153'),
         DeclareLaunchArgument('marker_size', default_value='0.10'),
         DeclareLaunchArgument('stream_port', default_value='8080'),
-        DeclareLaunchArgument('stack_pose_publish_hz', default_value='50.0'),
+        DeclareLaunchArgument('stack_pose_publish_hz', default_value='100.0'),
+        DeclareLaunchArgument('stack_pose_sync_adaptive', default_value='false'),
+        DeclareLaunchArgument('teknic_baud_rate', default_value='230400'),
+        DeclareLaunchArgument('cart_velocity_source', default_value='measured'),
+        DeclareLaunchArgument('motor_velocity_read_every_n', default_value='2'),
+        DeclareLaunchArgument('position_velocity_alpha', default_value='0.25'),
+        DeclareLaunchArgument('traj_write_on_change_only', default_value='false'),
+        DeclareLaunchArgument('traj_write_keepalive_s', default_value='0.10'),
+        DeclareLaunchArgument('traj_write_deadband_mm_s', default_value='0.5'),
 
         DeclareLaunchArgument('tracker_width', default_value='640'),
         DeclareLaunchArgument('tracker_height', default_value='400'),
@@ -105,7 +120,44 @@ def generate_launch_description():
             name='gantry_controller',
             output='screen',
             emulate_tty=True,
-            parameters=[gantry_yaml],
+            parameters=[
+                gantry_yaml,
+                {
+                    'stack_pose_publish_hz': ParameterValue(
+                        LaunchConfiguration('stack_pose_publish_hz'),
+                        value_type=float,
+                    ),
+                    'stack_pose_sync_adaptive': ParameterValue(
+                        LaunchConfiguration('stack_pose_sync_adaptive'),
+                        value_type=bool,
+                    ),
+                    'teknic_baud_rate': ParameterValue(
+                        LaunchConfiguration('teknic_baud_rate'),
+                        value_type=int,
+                    ),
+                    'cart_velocity_source': LaunchConfiguration('cart_velocity_source'),
+                    'motor_velocity_read_every_n': ParameterValue(
+                        LaunchConfiguration('motor_velocity_read_every_n'),
+                        value_type=int,
+                    ),
+                    'position_velocity_alpha': ParameterValue(
+                        LaunchConfiguration('position_velocity_alpha'),
+                        value_type=float,
+                    ),
+                    'traj_write_on_change_only': ParameterValue(
+                        LaunchConfiguration('traj_write_on_change_only'),
+                        value_type=bool,
+                    ),
+                    'traj_write_keepalive_s': ParameterValue(
+                        LaunchConfiguration('traj_write_keepalive_s'),
+                        value_type=float,
+                    ),
+                    'traj_write_deadband_mm_s': ParameterValue(
+                        LaunchConfiguration('traj_write_deadband_mm_s'),
+                        value_type=float,
+                    ),
+                },
+            ],
             condition=IfCondition(LaunchConfiguration('start_gantry')),
         ),
 
@@ -139,7 +191,15 @@ def generate_launch_description():
             executable='encoder_serial_node',
             name='encoder_serial_node',
             output='screen',
-            parameters=[encoder_serial_yaml],
+            parameters=[
+                encoder_serial_yaml,
+                {
+                    'publish_rate_hz': ParameterValue(
+                        LaunchConfiguration('encoder_publish_rate_hz'),
+                        value_type=float,
+                    ),
+                },
+            ],
             condition=IfCondition(PythonExpression([
                 "'", LaunchConfiguration('start_encoder'), "' == 'true' and '",
                 LaunchConfiguration('encoder_backend'), "' == 'serial'",
@@ -182,7 +242,28 @@ def generate_launch_description():
                 '--gantry-sign-y', LaunchConfiguration('gantry_sign_y'),
                 '--gantry-sign-z', LaunchConfiguration('gantry_sign_z'),
             ],
-            condition=IfCondition(LaunchConfiguration('start_tracker')),
+            # Legacy single-tag-pair tracker.  Mutually exclusive with the
+            # phase1 multi-face tracker below: both are named 'payload_tracker',
+            # both open the single OAK-D camera, and both publish /payload/state,
+            # so running both makes them race for the camera and interleave
+            # garbage.  phase1 wins by default; the legacy node only starts when
+            # start_tracker=true AND start_phase1_tracker=false.
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration('start_tracker'), "' == 'true' and '",
+                LaunchConfiguration('start_phase1_tracker'), "' == 'false'",
+            ])),
+        ),
+
+        Node(
+            package='payload_perception',
+            executable='phase1_tracker_node',
+            name='payload_tracker',
+            output='screen',
+            # phase1_tracker_node takes no CLI args; it reads the OAK-D IP from
+            # face_config.yaml camera.ip or the OAK_IP env var.  Forward the
+            # launch oak_ip so it can run standalone (empty = auto-discover).
+            additional_env={'OAK_IP': LaunchConfiguration('oak_ip')},
+            condition=IfCondition(LaunchConfiguration('start_phase1_tracker')),
         ),
 
         Node(

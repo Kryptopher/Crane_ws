@@ -14,9 +14,11 @@ import csv
 import json
 import math
 import os
+import subprocess
 import threading
 import time
 from collections import deque
+from pathlib import Path
 import urllib.error
 import urllib.request
 from http import HTTPStatus
@@ -29,13 +31,13 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.srv import GetParameters, SetParameters
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Empty, Float64, Float64MultiArray
+from std_msgs.msg import Empty, Float64, Float64MultiArray, String
 from std_srvs.srv import Trigger
 
 from gantry_control.msg import GantryState
-from gantry_control.srv import MoveTo, SetMode
+from gantry_control.srv import IcCartMove, MoveTo, SetMode
 from payload_perception_msgs.msg import PayloadState
 
 
@@ -49,7 +51,7 @@ class CraneDashboardServer(Node):
         self.declare_parameter('move_timeout_s', 180.0)
         self.declare_parameter('position_tolerance_m', 0.008)
         self.declare_parameter('homing_timeout_s', 45.0)
-        self.declare_parameter('stack_pose_publish_hz', 50.0)
+        self.declare_parameter('stack_pose_publish_hz', 100.0)
         self.declare_parameter('csv_dir', '/home/sanjay/crane_ws/csv')
         self.declare_parameter('csv_log_dir', '~/payload_logs')
         self.declare_parameter('csv_log_hz', 50.0)
@@ -90,11 +92,14 @@ class CraneDashboardServer(Node):
         self._motion_lock = threading.Lock()
         self._goto_running = False
         self._goto_status: Dict[str, str] = {'state': 'idle', 'message': ''}
+        self._stabilizer_proc: subprocess.Popen | None = None
         self._gantry_last_rx: float = 0.0
         self._payload_last_rx: float = 0.0
         self._pose_e_last_rx: float = 0.0
         self._pose_e_rel_last_rx: float = 0.0
         self._camera_last_rx: float = 0.0
+        self.ic_cart: Optional[Dict[str, float]] = None
+        self._ic_cart_last_rx: float = 0.0
         self._gantry_stale_s: float = 30.0
         self._gantry_loop_rate_hz: float = 0.0
         self._gantry_rx_times: deque = deque(maxlen=120)
@@ -126,6 +131,10 @@ class CraneDashboardServer(Node):
             qos_profile_sensor_data,
             callback_group=self._cb)
         self.create_subscription(
+            Float64MultiArray, '/ic_cart/state', self._on_ic_cart_state,
+            qos_profile_sensor_data,
+            callback_group=self._cb)
+        self.create_subscription(
             PayloadState, '/payload/state', self._on_payload_state,
             qos_profile_sensor_data,
             callback_group=self._cb)
@@ -149,8 +158,44 @@ class CraneDashboardServer(Node):
             SetParameters, '/encoder_serial_node/set_parameters')
         self._encoder_gpio_params_cli = self.create_client(
             SetParameters, '/encoder_node/set_parameters')
+        self._gantry_params_cli = self.create_client(
+            SetParameters, '/gantry_controller/set_parameters')
+        self._gantry_get_params_cli = self.create_client(
+            GetParameters, '/gantry_controller/get_parameters')
+        self._ic_cart_move_cli = self.create_client(
+            IcCartMove, '/ic_cart/move_to')
+        self._ic_cart_cal_cli = self.create_client(
+            Trigger, '/ic_cart/calibrate_origin')
+        self._ic_cart_stop_cli = self.create_client(Trigger, '/ic_cart/stop')
+        self._ic_cart_enable_cli = self.create_client(Trigger, '/ic_cart/enable')
+        self._ic_cart_disable_cli = self.create_client(
+            Trigger, '/ic_cart/disable')
         self._reset_vision_pub = self.create_publisher(
             Empty, '/payload/reset_origin', 10)
+        self._exp_start_pub = self.create_publisher(
+            Empty, '/experiment/start', 10)
+        self._exp_end_pub = self.create_publisher(
+            Empty, '/experiment/end', 10)
+        self._exp_start_x_pub = self.create_publisher(
+            Float64, '/experiment/set_start_x', 10)
+        self._exp_stop_pub = self.create_publisher(
+            Empty, '/experiment/stop', 10)
+        self._exp_save_pub = self.create_publisher(
+            String, '/experiment/save', 10)
+        self._experiment_state = 'idle'
+        self._experiment_run_active = False
+
+        # ── Camera↔encoder drift tracking ──
+        # The encoder is the source of truth; the camera is expected to
+        # disagree (small tags).  Deltas are only sampled when the system is
+        # quiescent (move done, swing settled, camera tracking) so real payload
+        # swing is never counted as drift.  Displayed, never alarmed on.
+        self._drift_ewma_tau_s = 3.0
+        self._drift_swing_settle_m_s = 0.01
+        self._drift: Dict[str, Any] = {}
+        self._drift_history: deque = deque(maxlen=300)
+        self._drift_last_hist_t: float = 0.0
+        self._reset_drift_stats()
 
         share = self._share_dir()
         self.web_dir = os.path.join(share, 'web')
@@ -179,9 +224,10 @@ class CraneDashboardServer(Node):
 
     @staticmethod
     def _estimate_hz(times: deque, now: float, window_s: float) -> float:
-        if len(times) < 2:
+        samples = tuple(times)
+        if len(samples) < 2:
             return 0.0
-        recent = [t for t in times if now - t <= window_s]
+        recent = [t for t in samples if now - t <= window_s]
         if len(recent) < 2:
             return 0.0
         span = recent[-1] - recent[0]
@@ -341,6 +387,7 @@ class CraneDashboardServer(Node):
         # MISSION auto-home paths. Published outside the lock.
         if just_homed:
             self._reset_vision_pub.publish(Empty())
+            self._reset_drift_stats()
             self.get_logger().info(
                 'Gantry homed — published /payload/reset_origin (camera re-zeroed)')
 
@@ -359,6 +406,84 @@ class CraneDashboardServer(Node):
             if len(msg.data) >= 5:
                 self.pose_e['pitch_count'] = float(msg.data[3])
                 self.pose_e['roll_count'] = float(msg.data[4])
+
+    def _on_ic_cart_state(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) < 5:
+            return
+        with self._gantry_lock:
+            self._ic_cart_last_rx = time.monotonic()
+            self.ic_cart = {
+                'step_pos_mm': float(msg.data[1]),
+                'enc_pos_mm': float(msg.data[2]),
+                'target_mm': float(msg.data[3]),
+                'moving': bool(msg.data[4] >= 0.5),
+                'stale': bool(msg.data[6] >= 0.5) if len(msg.data) >= 7 else False,
+            }
+
+    def _reset_drift_stats(self) -> None:
+        """Restart drift statistics — called on camera calibration and homing."""
+        with self._gantry_lock:
+            self._drift = {
+                'dx_mm': None, 'dy_mm': None,
+                'ewma_dx_mm': None, 'ewma_dy_mm': None,
+                'peak_dx_mm': 0.0, 'peak_dy_mm': 0.0,
+                'n_samples': 0,
+                'cal_t': time.monotonic(),
+                'last_sample_t': 0.0,
+                'sampling': False,
+            }
+            self._drift_history.clear()
+            self._drift_last_hist_t = 0.0
+
+    def _update_drift_locked(self, now: float) -> None:
+        """Sample camera↔encoder delta.  Caller holds _gantry_lock.
+
+        Gated on quiescence: the instantaneous delta includes real payload
+        swing (camera tracks the payload, motor encoders track the cart), so
+        only samples taken with the gantry idle and the rope swing settled
+        measure actual sensor drift."""
+        d = self._drift
+        if not d:
+            return
+        quiescent = bool(self.gantry.get('move_done', False))
+        if quiescent and self.pose_e_rel and (now - self._pose_e_rel_last_rx) < 2.0:
+            quiescent = (
+                abs(float(self.pose_e_rel.get('vx_rel_m_s', 0.0))) < self._drift_swing_settle_m_s
+                and abs(float(self.pose_e_rel.get('vy_rel_m_s', 0.0))) < self._drift_swing_settle_m_s
+            )
+        gantry_fresh = (self._gantry_last_rx > 0.0
+                        and (now - self._gantry_last_rx) < 2.0)
+        p = self.payload
+        gx = float(p.get('gantry_x', float('nan'))) if p else float('nan')
+        gy = float(p.get('gantry_y', float('nan'))) if p else float('nan')
+        sampling = (quiescent and gantry_fresh and bool(p and p.get('valid'))
+                    and math.isfinite(gx) and math.isfinite(gy))
+        d['sampling'] = sampling
+        if not sampling:
+            d['last_sample_t'] = 0.0
+            return
+        dx_mm = (float(self.gantry['x']) - gx) * 1000.0
+        dy_mm = (float(self.gantry['y']) - gy) * 1000.0
+        d['dx_mm'] = dx_mm
+        d['dy_mm'] = dy_mm
+        if d['ewma_dx_mm'] is None:
+            d['ewma_dx_mm'] = dx_mm
+            d['ewma_dy_mm'] = dy_mm
+        else:
+            dt = (now - d['last_sample_t']) if d['last_sample_t'] > 0.0 else 0.05
+            a = 1.0 - math.exp(-max(dt, 1e-3) / self._drift_ewma_tau_s)
+            d['ewma_dx_mm'] += a * (dx_mm - d['ewma_dx_mm'])
+            d['ewma_dy_mm'] += a * (dy_mm - d['ewma_dy_mm'])
+        d['last_sample_t'] = now
+        d['n_samples'] += 1
+        if abs(dx_mm) > abs(d['peak_dx_mm']):
+            d['peak_dx_mm'] = dx_mm
+        if abs(dy_mm) > abs(d['peak_dy_mm']):
+            d['peak_dy_mm'] = dy_mm
+        if now - self._drift_last_hist_t >= 1.0:
+            self._drift_last_hist_t = now
+            self._drift_history.append(
+                (round(now - d['cal_t'], 1), round(dx_mm, 1), round(dy_mm, 1)))
 
     def _on_payload_state(self, msg: PayloadState) -> None:
         now = time.monotonic()
@@ -385,6 +510,7 @@ class CraneDashboardServer(Node):
                 'valid': bool(msg.valid),
                 'interpolated': bool(msg.interpolated),
             }
+            self._update_drift_locked(now)
 
     def _on_pose_e_rel(self, msg: Float64MultiArray) -> None:
         if len(msg.data) < 9:
@@ -451,6 +577,10 @@ class CraneDashboardServer(Node):
             gantry_loop_rate_hz = self._gantry_loop_rate_hz
             stack_sync_hz = self._stack_sync_hz
             stack_sync_last_rx = self._stack_sync_last_rx
+            drift = dict(self._drift) if self._drift else None
+            drift_history = list(self._drift_history)
+            ic_cart = dict(self.ic_cart) if self.ic_cart else None
+            ic_cart_last_rx = self._ic_cart_last_rx
         with self._media_lock:
             camera_last_rx = self._camera_last_rx
             camera_frame_id = int(getattr(self, '_camera_frame_id', 0))
@@ -491,6 +621,25 @@ class CraneDashboardServer(Node):
                 pose_rates_synced and abs(pose_e_hz - ref_hz) <= tol
             )
 
+        camera_drift = None
+        if drift is not None:
+            def _r1(v):
+                return round(v, 1) if isinstance(v, float) else v
+            camera_drift = {
+                'dx_mm': _r1(drift['dx_mm']),
+                'dy_mm': _r1(drift['dy_mm']),
+                'ewma_dx_mm': _r1(drift['ewma_dx_mm']),
+                'ewma_dy_mm': _r1(drift['ewma_dy_mm']),
+                'peak_dx_mm': _r1(drift['peak_dx_mm']),
+                'peak_dy_mm': _r1(drift['peak_dy_mm']),
+                'n_samples': int(drift['n_samples']),
+                # A frozen camera stream can't be sampling, whatever the last
+                # payload callback decided.
+                'sampling': bool(drift['sampling']) and payload_live,
+                't_since_cal_s': round(now - float(drift['cal_t']), 1),
+                'history': drift_history,
+            }
+
         px, py = float(g['x']), float(g['y'])
         position_source = 'gantry'
         if not gantry_live and payload:
@@ -525,12 +674,20 @@ class CraneDashboardServer(Node):
             'gantry_ever_received': gantry_ever,
             'gantry_stale_s': gantry_stale_s,
             'payload_live': payload_live,
+            'payload_stale_s': (
+                round(now - payload_last_rx, 2) if payload_last_rx > 0.0 else None
+            ),
+            'camera_drift': camera_drift,
             'pose_e_live': pose_e_live,
             'pose_e_hz': round(pose_e_hz, 1),
             'pose_e_rel_live': pose_e_rel_live,
             'pose_e_rel_hz': round(pose_e_rel_hz, 1),
             'camera_live': camera_live,
             'camera_frame_id': camera_frame_id,
+            'ic_cart': ic_cart,
+            'ic_cart_live': (
+                ic_cart_last_rx > 0.0 and (now - ic_cart_last_rx) < 2.0
+            ),
             'goto_status': dict(self._goto_status),
             'stack_pose_publish_hz': target_hz,
             'stack_sync_hz': round(stack_sync_hz, 1) if sync_live else None,
@@ -538,7 +695,14 @@ class CraneDashboardServer(Node):
             'gantry_hz': round(gantry_hz, 1),
             'payload_hz': round(payload_hz, 1),
             'pose_rates_synced': pose_rates_synced,
+            'experiment': self._experiment_state,
         }
+
+    def _payload_fresh(self, max_age_s: float = 2.0) -> bool:
+        """True if /payload/state (camera tracking) arrived recently."""
+        with self._gantry_lock:
+            last_rx = self._payload_last_rx
+        return last_rx > 0.0 and (time.monotonic() - last_rx) < max_age_s
 
     def _call_trigger(self, client, timeout: float = 5.0) -> tuple[bool, str]:
         if not client.wait_for_service(timeout_sec=2.0):
@@ -548,6 +712,26 @@ class CraneDashboardServer(Node):
             return False, 'Service call timeout'
         if not future.done() or future.result() is None:
             return False, 'Service call failed'
+        r = future.result()
+        return bool(r.success), str(r.message)
+
+    def _call_ic_cart_move(
+        self,
+        position_mm: float,
+        velocity_mm_s: float,
+        timeout: float = 5.0,
+    ) -> tuple[bool, str]:
+        client = self._ic_cart_move_cli
+        if not client.wait_for_service(timeout_sec=2.0):
+            return False, 'IC cart node not running'
+        req = IcCartMove.Request()
+        req.position_mm = float(position_mm)
+        req.velocity_mm_s = float(velocity_mm_s)
+        future = client.call_async(req)
+        if not self._wait_future(future, timeout):
+            return False, 'IC cart move timeout'
+        if not future.done() or future.result() is None:
+            return False, 'IC cart move failed'
         r = future.result()
         return bool(r.success), str(r.message)
 
@@ -581,6 +765,119 @@ class CraneDashboardServer(Node):
                 return True, f'{name} set to {value:.3f}'
             return False, result.reason or f'{client.srv_name} rejected {name}'
         return False, 'No encoder parameter service available'
+
+    def _get_gantry_move_vel(self, timeout: float = 3.0) -> Optional[float]:
+        """Read the controller's current mission_move_vel_ms (m/s), or None."""
+        client = self._gantry_get_params_cli
+        if not client.wait_for_service(timeout_sec=1.0):
+            return None
+        req = GetParameters.Request()
+        req.names = ['mission_move_vel_ms']
+        future = client.call_async(req)
+        if not self._wait_future(future, timeout):
+            return None
+        if not future.done() or future.result() is None or not future.result().values:
+            return None
+        val = future.result().values[0]
+        if val.type != ParameterType.PARAMETER_DOUBLE:
+            return None
+        return float(val.double_value)
+
+    def _set_gantry_move_vel(self, vel_ms: float,
+                             timeout: float = 3.0) -> tuple[bool, str]:
+        """Set the controller's mission_move_vel_ms at runtime (clamped there)."""
+        param = Parameter()
+        param.name = 'mission_move_vel_ms'
+        param.value = ParameterValue()
+        param.value.type = ParameterType.PARAMETER_DOUBLE
+        param.value.double_value = float(vel_ms)
+        client = self._gantry_params_cli
+        if not client.wait_for_service(timeout_sec=1.0):
+            return False, 'Gantry parameter service not available'
+        req = SetParameters.Request()
+        req.parameters = [param]
+        future = client.call_async(req)
+        if not self._wait_future(future, timeout):
+            return False, 'set_parameters timeout'
+        if not future.done() or future.result() is None or not future.result().results:
+            return False, 'set_parameters failed'
+        r = future.result().results[0]
+        if r.successful:
+            return True, f'move vel set to {vel_ms:.3f} m/s'
+        return False, r.reason or 'set_parameters rejected'
+
+    def _start_experiment_run_async(self, axis: str, direction: float,
+                                    displacement_mm: float,
+                                    velocity_mm_s: float) -> None:
+        """Commanded-move experiment: set speed, record encoders+camera over a
+        single move of ±displacement along one axis, then hold the data for a
+        titled save (experiment_save action → /experiment/save)."""
+        def run() -> None:
+            prev_vel: Optional[float] = None
+            recording = False
+            try:
+                with self._motion_lock:
+                    if self._goto_running:
+                        self._set_goto_status('error', 'Motion already running')
+                        return
+                    self._goto_running = True
+                self._experiment_run_active = True
+                with self._gantry_lock:
+                    gx = float(self.gantry.get('x', 0.0))
+                    gy = float(self.gantry.get('y', 0.0))
+                disp_m = direction * displacement_mm / 1000.0
+                tx, ty = gx, gy
+                if axis == 'x':
+                    tx = min(max(gx + disp_m, 0.0), self.workspace_m)
+                else:
+                    ty = min(max(gy + disp_m, 0.0), self.workspace_m)
+                actual_mm = ((tx - gx) if axis == 'x' else (ty - gy)) * 1000.0
+                if abs(actual_mm) < 1.0:
+                    self._set_goto_status(
+                        'error', 'Experiment move clamps to zero — at workspace edge')
+                    return
+                prev_vel = self._get_gantry_move_vel()
+                ok, msg = self._set_gantry_move_vel(velocity_mm_s / 1000.0)
+                if not ok:
+                    self._set_goto_status('error', f'Velocity set failed: {msg}')
+                    return
+                self._set_goto_status(
+                    'running',
+                    f'Experiment: {actual_mm:+.0f} mm {axis.upper()} '
+                    f'@ {velocity_mm_s:.0f} mm/s')
+                self._exp_start_pub.publish(Empty())
+                self._experiment_state = 'recording'
+                recording = True
+                time.sleep(0.5)          # pre-move baseline in the recording
+                ok, msg = self._call_move_to(tx, ty)
+                if not ok:
+                    self._set_goto_status('error', f'Experiment move failed: {msg}')
+                    return
+                ok_move, wait_msg = self._wait_move_done(tx, ty)
+                time.sleep(10.0)         # capture post-move residual swing
+                self._exp_stop_pub.publish(Empty())
+                recording = False
+                self._experiment_state = 'awaiting_save'
+                if ok_move:
+                    self._set_goto_status(
+                        'done', 'Experiment run complete — title it and Save')
+                else:
+                    self._set_goto_status(
+                        'error',
+                        f'{wait_msg or "Move timed out"} — data held, you can still Save')
+            finally:
+                if recording:
+                    # Bail-out path: stop recording so the tracker isn't left
+                    # logging forever; data stays held (save or overwrite).
+                    self._exp_stop_pub.publish(Empty())
+                    self._experiment_state = 'idle'
+                if prev_vel is not None:
+                    self._set_gantry_move_vel(prev_vel)
+                self._experiment_run_active = False
+                with self._motion_lock:
+                    self._goto_running = False
+
+        threading.Thread(target=run, daemon=True, name='experiment_run').start()
 
     def _call_set_mode(
         self,
@@ -675,6 +972,8 @@ class CraneDashboardServer(Node):
             ok, msg = self._call_trigger(self._clear_estop_cli)
         elif name == 'traj_arm':
             ok, msg = self._call_set_mode('TRAJ')
+        elif name == 'stabilize_payload':
+            ok, msg = self._start_payload_stabilizer()
         elif name == 'start_csv_log':
             ok, msg = self._start_csv_log()
         elif name == 'stop_csv_log':
@@ -728,6 +1027,98 @@ class CraneDashboardServer(Node):
                 }
             ok, msg = self._set_encoder_float_param(
                 'rope_length_m', rope_length_m)
+        elif name == 'experiment_start':
+            self._exp_start_pub.publish(Empty())
+            self._experiment_state = 'recording'
+            ok, msg = True, 'Experiment started'
+        elif name == 'experiment_end':
+            self._exp_end_pub.publish(Empty())
+            self._experiment_state = 'saved'
+            ok, msg = True, 'Experiment ended — saving data'
+        elif name == 'experiment_run':
+            try:
+                axis = str(data.get('axis', 'x')).lower()
+                direction = 1.0 if float(data.get('direction', 1)) >= 0 else -1.0
+                disp = float(data.get('displacement_mm', 0.0))
+                vel = float(data.get('velocity_mm_s', 0.0))
+            except (TypeError, ValueError):
+                return {'status': 'error', 'message': 'Bad experiment parameters'}
+            if axis not in ('x', 'y'):
+                return {'status': 'error', 'message': "axis must be 'x' or 'y'"}
+            if not (1.0 <= disp <= 5000.0):
+                return {'status': 'error',
+                        'message': 'Displacement must be 1–5000 mm'}
+            if not (5.0 <= vel <= 1000.0):
+                return {'status': 'error',
+                        'message': 'Velocity must be 5–1000 mm/s'}
+            with self._gantry_lock:
+                homed = bool(self.gantry.get('homed', False))
+                enabled = bool(self.gantry.get('enabled', False))
+            if not (homed and enabled):
+                return {'status': 'error',
+                        'message': 'Gantry must be homed and enabled first'}
+            if self._goto_running or self.mission_running:
+                return {'status': 'error', 'message': 'Motion already running'}
+            self._start_experiment_run_async(axis, direction, disp, vel)
+            ok = True
+            msg = (f'Experiment run started: {direction * disp:+.0f} mm '
+                   f'{axis.upper()} @ {vel:.0f} mm/s')
+        elif name == 'experiment_save':
+            title = str(data.get('title', '')).strip()
+            m = String()
+            m.data = title
+            self._exp_save_pub.publish(m)
+            self._experiment_state = 'saved'
+            ok = True
+            msg = f'Experiment saved — {title}' if title else 'Experiment saved'
+        elif name == 'set_start_x':
+            val = float(data.get('start_x_mm', 350.0))
+            f64 = Float64()
+            f64.data = val
+            self._exp_start_x_pub.publish(f64)
+            ok, msg = True, f'Start X offset set to {val:.1f} mm'
+        elif name == 'cal_origin':
+            self._reset_vision_pub.publish(Empty())
+            self._reset_drift_stats()
+            enc_ok, _ = self._call_trigger(self._encoder_reset_cli)
+            with self._gantry_lock:
+                gx = float(self.gantry.get('x', 0.0))
+                gy = float(self.gantry.get('y', 0.0))
+            ok = True
+            msg = f'Origin set @ ({gx * 1000:.0f}, {gy * 1000:.0f}) mm'
+            if not self._payload_fresh():
+                msg += ' — camera not tracking, applies on next detection'
+            if not enc_ok:
+                msg += ' (encoder reset skipped)'
+        elif name == 'cal_camera_ref':
+            self._reset_vision_pub.publish(Empty())
+            self._reset_drift_stats()
+            with self._gantry_lock:
+                gx = float(self.gantry.get('x', 0.0))
+                gy = float(self.gantry.get('y', 0.0))
+            ok = True
+            if self._payload_fresh():
+                msg = f'Camera origin set @ ({gx * 1000:.0f}, {gy * 1000:.0f}) mm'
+            else:
+                msg = ('Calibration queued — camera not tracking '
+                       '(applies on next detection)')
+        elif name == 'cal_encoder_ref':
+            ok, msg = self._call_trigger(self._encoder_reset_cli)
+            if ok:
+                msg = 'Encoder origin reset'
+        elif name == 'ic_cart_calibrate':
+            ok, msg = self._call_trigger(self._ic_cart_cal_cli)
+        elif name == 'ic_cart_move':
+            ok, msg = self._call_ic_cart_move(
+                float(data.get('position_mm', 0.0)),
+                float(data.get('velocity_mm_s', 0.0)),
+            )
+        elif name == 'ic_cart_stop':
+            ok, msg = self._call_trigger(self._ic_cart_stop_cli)
+        elif name == 'ic_cart_enable':
+            ok, msg = self._call_trigger(self._ic_cart_enable_cli)
+        elif name == 'ic_cart_disable':
+            ok, msg = self._call_trigger(self._ic_cart_disable_cli)
         else:
             return {'status': 'error', 'message': f'Unknown action: {name}'}
         return {'status': 'ok' if ok else 'error', 'message': msg}
@@ -748,6 +1139,7 @@ class CraneDashboardServer(Node):
     def safe_shutdown_gantry(self) -> None:
         """Best-effort motor disable when dashboard exits (Ctrl+C on launch)."""
         self._stop_csv_log()
+        self._stop_payload_stabilizer()
         self.get_logger().warn(
             'Dashboard shutdown — disabling gantry motors (/gantry/disable)')
         try:
@@ -839,6 +1231,65 @@ class CraneDashboardServer(Node):
         if not ok:
             return False, msg
         return True, msg or 'Sensor homing started (back → left)'
+
+    def _start_payload_stabilizer(self) -> tuple[bool, str]:
+        if self._stabilizer_proc is not None and self._stabilizer_proc.poll() is None:
+            return False, 'Payload stabilizer already running'
+        with self._gantry_lock:
+            if self._goto_running or self.mission_running:
+                return False, 'Wait for the current move to finish before stabilizing payload'
+            if self.gantry.get('estop', False):
+                return False, 'E-stop active — clear E-stop first'
+            if not self.gantry.get('homed', False):
+                return False, 'Not homed — run Home first'
+            if not self.gantry.get('move_done', True):
+                return False, 'Gantry is still moving — wait for arrival first'
+
+        log_dir = Path('/home/sanjay/crane_ws/log/payload_stabilizer')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        csv_path = log_dir / f'dashboard_both_{stamp}.csv'
+        terminal_log_path = log_dir / f'dashboard_both_{stamp}.log'
+        command_text = (
+            'cd /home/sanjay/crane_ws\n'
+            'source install/setup.bash\n'
+            'ros2 run gantry_control payload_stabilizer.py '
+            f'--log-csv {csv_path}'
+        )
+        cmd = ['bash', '-lc', command_text]
+        try:
+            terminal_log = terminal_log_path.open('w')
+            terminal_log.write('$ ' + command_text.replace('\n', '\n$ ') + '\n\n')
+            terminal_log.flush()
+            self._stabilizer_proc = subprocess.Popen(
+                cmd,
+                cwd='/home/sanjay/crane_ws',
+                start_new_session=True,
+                stdout=terminal_log,
+                stderr=subprocess.STDOUT,
+            )
+            terminal_log.close()
+        except Exception as exc:
+            self._stabilizer_proc = None
+            return False, f'Failed to start payload stabilizer: {exc}'
+        self.get_logger().info(
+            f'Payload stabilizer started pid={self._stabilizer_proc.pid} log={csv_path}')
+        return True, f'Payload stabilizer started ({csv_path})'
+
+    def _stop_payload_stabilizer(self) -> None:
+        proc = self._stabilizer_proc
+        if proc is None or proc.poll() is not None:
+            self._stabilizer_proc = None
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._stabilizer_proc = None
 
     def _set_goto_status(self, state: str, message: str) -> None:
         with self._gantry_lock:
